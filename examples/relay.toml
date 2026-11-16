@@ -1,0 +1,22 @@
+# 公网中继配置。两个 Token 都是占位符，部署前分别替换为不同随机值。
+listen = "0.0.0.0:443"
+websocket_path = "/netcrow"
+pending_timeout_secs = 90
+max_streams_per_peer = 256
+peer_timeout_secs = 60
+
+# 可省略整个 tls 表；默认在本配置目录生成、保存并复用这两个文件。
+[tls]
+cert_path = "netcrow-cert.pem"
+key_path = "netcrow-key.pem"
+names = ["relay.example.com"]
+
+[[peers]]
+id = "office"
+token = "REPLACE_WITH_RANDOM_OFFICE_TOKEN_AT_LEAST_32_BYTES"
+allowed_subnets = ["192.168.1.0/24"]
+
+[[peers]]
+id = "home"
+token = "REPLACE_WITH_RANDOM_HOME_TOKEN_AT_LEAST_32_BYTES"
+allowed_subnets = []
