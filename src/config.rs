@@ -14,7 +14,7 @@ fn heartbeat_timeout() -> u64 {
     60
 }
 fn sleep() -> u64 {
-    60
+    10
 }
 fn idle() -> u64 {
     600

@@ -18,7 +18,7 @@ spki_sha256 = "sha256/AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
 [connection]
 # 0 表示一直保活和断线重连；600 表示无业务活动 10 分钟后休眠。
 idle_secs = 600
-sleep_secs = 60
+sleep_secs = 10
 probe_secs = 2
 heartbeat_secs = 20
 heartbeat_timeout_secs = 60

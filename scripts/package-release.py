@@ -44,6 +44,9 @@ def package(root: Path, target: str, tag: str, output: Path) -> Path:
     files += [(root / name, name, 0o644) for name in ("README.md", "LICENSE")]
     files += [(root / "examples" / name, f"examples/{name}", 0o644)
               for name in ("relay.toml", "office.toml", "home.toml")]
+    if "linux" in target:
+        files += [(root / name, name, 0o644)
+                  for name in ("netcrow-client.service", "netcrow-relay.service")]
     for path, _, _ in files:
         if path.is_symlink() or not path.is_file():
             raise ValueError(f"required release file is missing or not a regular file: {path}")

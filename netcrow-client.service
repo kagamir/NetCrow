@@ -1,0 +1,30 @@
+[Unit]
+Description=NetCrow subnet-sharing client
+Documentation=https://github.com/kagamir/NetCrow
+Wants=network-online.target
+After=network-online.target
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=netcrow
+Group=netcrow
+StateDirectory=netcrow
+StateDirectoryMode=0700
+WorkingDirectory=/var/lib/netcrow
+ExecStartPre=/usr/local/bin/netcrow check --mode client --config /etc/netcrow/client.toml
+ExecStart=/usr/local/bin/netcrow client --config /etc/netcrow/client.toml
+Restart=on-failure
+RestartSec=5
+KillSignal=SIGINT
+TimeoutStopSec=20
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+CapabilityBoundingSet=
+
+[Install]
+WantedBy=multi-user.target

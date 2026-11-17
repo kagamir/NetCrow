@@ -34,6 +34,32 @@ curl --proxy http://127.0.0.1:8080 http://192.168.1.20/
 
 启动前可用 `./netcrow check --mode client --config home.toml` 检查配置；中继使用 `--mode relay`。修改配置后重启生效。未配置对应监听地址时，不启动该代理服务。
 
+### Ubuntu systemd 服务
+
+根目录提供 [netcrow-client.service](netcrow-client.service) 和 [netcrow-relay.service](netcrow-relay.service)，打包时也会包含在 Linux 发布包中。二进制固定为 `/usr/local/bin/netcrow`，配置分别为 `/etc/netcrow/client.toml` 和 `/etc/netcrow/relay.toml`，使用独立的 `netcrow` 系统账号运行。
+
+以下以客户端为例，在源码目录或解压后的 Linux 发布目录执行；源码构建时把 `./netcrow` 换成 `target/release/netcrow`。账号仅需创建一次：
+
+```bash
+sudo useradd --system --user-group --home-dir /var/lib/netcrow --shell /usr/sbin/nologin netcrow
+sudo install -m 0755 ./netcrow /usr/local/bin/netcrow
+sudo install -d -m 0750 -o root -g netcrow /etc/netcrow
+sudo install -m 0640 -o root -g netcrow examples/home.toml /etc/netcrow/client.toml
+sudoedit /etc/netcrow/client.toml
+sudo install -m 0644 netcrow-client.service netcrow-relay.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now netcrow-client.service
+```
+
+共享子网的客户端可改用 `examples/office.toml`。中继改为复制 `examples/relay.toml` 到 `/etc/netcrow/relay.toml`，编辑 ID、Token 等配置，并将已有 `[tls]` 表中的两个路径改为服务可写的数据目录：
+
+```toml
+cert_path = "/var/lib/netcrow/netcrow-cert.pem"
+key_path = "/var/lib/netcrow/netcrow-key.pem"
+```
+
+然后启用 `netcrow-relay.service`。`/var/lib/netcrow` 由 systemd 自动创建；中继具有绑定 443 等低端口的权限，首次启动会生成证书，用 `sudo /usr/local/bin/netcrow fingerprint --cert /var/lib/netcrow/netcrow-cert.pem` 查看指纹。使用已有证书时，文件须允许 `netcrow` 账号读取。服务会在异常退出后重启；修改配置后运行 `sudo systemctl restart netcrow-client.service`（中继替换服务名），用 `journalctl -u netcrow-client.service -f` 查看日志。
+
 ## 共享与分流
 
 `shared_subnets` 决定**本机向其他客户端共享哪些子网**，由客户端自行配置；中继只需登记客户端 ID 和 Token。目标服务看到的连接来源是共享方电脑，无需开启系统 IP 转发。
@@ -104,7 +130,7 @@ allow_remote_proxy = false   # 默认：禁止代理监听非回环地址
 
 [connection]                # 整表可省略，使用以下默认值
 idle_secs = 600              # 默认：10 分钟无隧道业务活动后休眠；0 表示一直保活
-sleep_secs = 60              # 默认：休眠后等待多久再上线检查
+sleep_secs = 10              # 默认：休眠后等待多久再上线检查
 probe_secs = 2               # 默认：检查窗口，无待办业务则再次断开
 heartbeat_secs = 20         # 默认：WSS 心跳间隔
 heartbeat_timeout_secs = 60 # 默认：多久未收到中继消息后断开，须大于心跳间隔
@@ -135,7 +161,7 @@ enable = []                 # 默认：无恢复规则；任一规则匹配即�
 
 ## 连接与休眠
 
-发起中继请求或传输业务字节算活动，心跳、路由更新、定期检查和直连流量不算。本机中继请求立即唤醒本机；远端休眠时，中继暂存新连接请求，等待其下次上线。默认 10 分钟无活动后休眠，每隔约 1 分钟上线检查。中继 `pending_timeout_secs` 与发起方 `open_timeout_secs` 应大于远端 `sleep_secs` 并预留连接时间。
+发起中继请求或传输业务字节算活动，心跳、路由更新、定期检查和直连流量不算。本机中继请求立即唤醒本机；远端休眠时，中继暂存新连接请求，等待其下次上线。默认 10 分钟无活动后休眠，每隔约 10 秒上线检查。中继 `pending_timeout_secs` 与发起方 `open_timeout_secs` 应大于远端 `sleep_secs` 并预留连接时间。
 
 休眠、断线或停用会关闭已有隧道 TCP 会话，恢复后不续接或重放，应用需自行重试。中继在内存保留离线路由；中继重启后，共享方重新注册才能恢复路由。
 

@@ -11,7 +11,7 @@ spki_sha256 = "sha256/AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
 
 [connection]
 idle_secs = 600
-sleep_secs = 60
+sleep_secs = 10
 probe_secs = 2
 heartbeat_secs = 20
 heartbeat_timeout_secs = 60

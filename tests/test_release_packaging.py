@@ -23,7 +23,8 @@ class ReleasePackagingTests(unittest.TestCase):
         self.output = self.root / "dist"
         (self.root / "examples").mkdir()
         for name in ("README.md", "LICENSE", "examples/relay.toml",
-                     "examples/office.toml", "examples/home.toml"):
+                     "examples/office.toml", "examples/home.toml",
+                     "netcrow-client.service", "netcrow-relay.service"):
             (self.root / name).write_text(f"fixture for {name}\n", encoding="utf-8")
         # Files outside the explicit distribution list must never enter a release.
         (self.root / "private-key.pem").write_text("not for distribution", encoding="utf-8")
@@ -46,6 +47,10 @@ class ReleasePackagingTests(unittest.TestCase):
                 binary_name, "README.md", "LICENSE", "examples/relay.toml",
                 "examples/office.toml", "examples/home.toml",
             )}
+            if "linux" in target:
+                expected.update(f"{stem}/{name}" for name in (
+                    "netcrow-client.service", "netcrow-relay.service",
+                ))
             if path.suffix == ".zip":
                 with zipfile.ZipFile(path) as archive:
                     self.assertEqual(set(archive.namelist()), expected)
