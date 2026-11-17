@@ -212,19 +212,22 @@ class Harness:
 
 
 def client_config(peer, relay_port, pin, *, socks=None, http=None, shares=False,
-                  token=TOKEN, idle=0, control_port=None, open_timeout=12):
+                  token=TOKEN, idle=0, control_port=None, open_timeout=12,
+                  proxy_subnets=None, sleep_secs=4):
     lines = [
         f'id = "{peer}"', f'token = "{token}"',
         f'relay_url = "wss://localhost:{relay_port}/netcrow"',
         f'shared_subnets = {["127.0.0.1/32"] if shares else []!r}'.replace("'", '"'),
     ]
+    if proxy_subnets is not None:
+        lines.append(f"proxy_subnets = {proxy_subnets!r}".replace("'", '"'))
     if socks:
         lines.append(f'socks5_listen = "127.0.0.1:{socks}"')
     if http:
         lines.append(f'http_listen = "127.0.0.1:{http}"')
     lines += [
         "[tls]", f'spki_sha256 = "{pin}"', "[connection]",
-        f"idle_secs = {idle}", "sleep_secs = 4", "probe_secs = 1",
+        f"idle_secs = {idle}", f"sleep_secs = {sleep_secs}", "probe_secs = 1",
         "heartbeat_secs = 1", "heartbeat_timeout_secs = 4", "reconnect_secs = 1",
         f"open_timeout_secs = {open_timeout}", "connect_timeout_secs = 2", "max_streams = 128",
     ]
@@ -251,9 +254,8 @@ def run(binary):
         relay_port, socks_port, http_port = (free_port() for _ in range(3))
         try:
             peers = "\n".join(
-                f'[[peers]]\nid = "{peer}"\ntoken = "{TOKEN}"\nallowed_subnets = '
-                + ('["127.0.0.1/32"]' if peer == "office" else "[]")
-                for peer in ("office", "home", "pinbad", "authbad", "ca")
+                f'[[peers]]\nid = "{peer}"\ntoken = "{TOKEN}"'
+                for peer in ("office", "home", "pinbad", "authbad", "ca", "selected", "sleepy")
             )
             relay = harness.write("relay", f'''
 listen = "127.0.0.1:{relay_port}"
@@ -266,7 +268,7 @@ key_path = "relay-key.pem"
 names = ["localhost", "127.0.0.1"]
 {peers}
 ''')
-            harness.start("relay", "relay", relay)
+            relay_process = harness.start("relay", "relay", relay)
             cert = harness.directory / "relay-cert.pem"
             wait_until(lambda: cert.exists() and cert.stat().st_size > 100, "relay certificate")
             output = subprocess.check_output(
@@ -279,6 +281,8 @@ names = ["localhost", "127.0.0.1"]
             home = harness.write("home", client_config("home", relay_port, pin, socks=socks_port,
                                                        http=http_port, control_port=target_port))
             harness.start("office", "client", office)
+            # Ensure the first automatic policy snapshot already includes this route.
+            harness.wait_log("office", "WSS connected")
             harness.start("home", "client", home)
             wait_until(lambda: get_via_socks(socks_port, target_port), "SOCKS routed request", timeout=20)
             print("PASS SOCKS5 IPv4 + large payload")
@@ -355,13 +359,13 @@ names = ["localhost", "127.0.0.1"]
             with socket.create_connection(("127.0.0.2", outside.server_port), timeout=5) as sock:
                 sock.sendall(b"GET /payload HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
                 verify_http(receive_all(sock))
-            assert_rejected(lambda: socks_connect(socks_port, "127.0.0.2", outside.server_port))
+            assert get_via_socks(socks_port, outside.server_port, host="127.0.0.2")
             with socket.create_connection(("127.0.0.1", socks_port), timeout=5) as sock:
                 sock.sendall(b"\x05\x01\x00")
                 assert receive(sock, 2) == b"\x05\x00"
                 sock.sendall(b"\x05\x03\x00\x01\x7f\x00\x00\x01\x00\x35")
                 assert receive(sock, 2) == b"\x05\x07", "UDP ASSOCIATE must be unsupported"
-            print("PASS out-of-route rejection + SOCKS UDP rejection")
+            print("PASS default direct routing outside remote subnets + SOCKS UDP rejection")
 
             offset = len(harness.log("office"))
             harness.wait_log("office", "entering sleep", after=offset)
@@ -369,6 +373,20 @@ names = ["localhost", "127.0.0.1"]
             harness.wait_log("office", "checking pending requests", after=offset)
             print("PASS control polls do not reset idle + offline queued request + scheduled wake")
 
+            # A chosen but unadvertised address must fail, without falling back to direct.
+            # Conversely, an advertised address excluded by this filter must go direct.
+            selected_port = free_port()
+            selected_config = harness.write("selected", client_config(
+                "selected", relay_port, pin, socks=selected_port,
+                proxy_subnets=["127.0.0.2/32"], control_port=target_port, open_timeout=3,
+            ))
+            harness.start("selected", "client", selected_config)
+            harness.wait_log("selected", "WSS connected")
+            assert_rejected(lambda: socks_connect(selected_port, "127.0.0.2", outside.server_port, timeout=5))
+            assert get_via_socks(selected_port, target_port)
+            print("PASS explicit selection rejects missing route and excludes advertised subnet")
+
+            active_direct = socks_connect(socks_port, "127.0.0.2", outside.server_port)
             active = socks_connect(socks_port, "127.0.0.1", halfclose_port)
             active.sendall(b"unfinished request")
             home_offset = len(harness.log("home"))
@@ -382,7 +400,14 @@ names = ["localhost", "127.0.0.1"]
             finally:
                 active.close()
             assert_rejected(lambda: socks_connect(socks_port, "127.0.0.1", target_port, timeout=4))
-            print("PASS remote disable wins conflict + closes active streams + rejects new requests")
+            assert get_via_socks(socks_port, outside.server_port, host="127.0.0.2")
+            with active_direct:
+                active_direct.sendall(b"GET /payload HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+                verify_http(receive_all(active_direct))
+            harness.wait_log("selected", "remote control disabled client")
+            assert get_via_socks(selected_port, target_port)
+            assert_rejected(lambda: socks_connect(selected_port, "127.0.0.2", outside.server_port, timeout=4))
+            print("PASS remote disable closes tunnel streams while existing/new direct streams continue")
 
             CONTROL["body"] = b"RUN"
             CONTROL["status"] = 500
@@ -396,7 +421,8 @@ names = ["localhost", "127.0.0.1"]
             print("PASS control HTTP failure preserves disabled state + recovery reconnects")
 
             ca_proxy_port = free_port()
-            ca_config = client_config("ca", relay_port, pin, socks=ca_proxy_port)
+            ca_config = client_config("ca", relay_port, pin, socks=ca_proxy_port,
+                                      proxy_subnets=["127.0.0.1/32"])
             ca_config = ca_config.replace(f'spki_sha256 = "{pin}"', 'ca_cert_path = "relay-cert.pem"')
             ca_process = harness.start("ca", "client", harness.write("ca", ca_config))
             wait_until(lambda: get_via_socks(ca_proxy_port, target_port), "custom CA verified connection")
@@ -410,7 +436,8 @@ names = ["localhost", "127.0.0.1"]
             ):
                 rejected_port = free_port()
                 config = harness.write(peer, client_config(peer, relay_port, candidate_pin,
-                                                           socks=rejected_port, token=token, open_timeout=3))
+                                                           socks=rejected_port, token=token, open_timeout=3,
+                                                           proxy_subnets=["127.0.0.1/32"]))
                 process = harness.start(peer, "client", config)
                 # Listener availability is independent of TLS/auth success.
                 wait_until(lambda: listener_open(rejected_port), f"{peer} proxy listener")
@@ -418,7 +445,63 @@ names = ["localhost", "127.0.0.1"]
                 process.terminate()
                 process.wait(timeout=5)
             print("PASS incorrect SPKI pin + incorrect peer token cannot forward")
-            for name in ("relay", "home", "office"):
+            # An explicit empty list works before any successful relay handshake.
+            unavailable_port = free_port()
+            direct_port = free_port()
+            direct_config = harness.write("direct", client_config(
+                "direct", unavailable_port, pin, socks=direct_port, proxy_subnets=[], open_timeout=3,
+            ))
+            harness.start("direct", "client", direct_config)
+            wait_until(lambda: get_via_socks(direct_port, target_port), "cold all-direct client")
+            assert get_via_socks(direct_port, outside.server_port, host="127.0.0.2")
+            print("PASS empty selection is all-direct even before contacting unavailable relay")
+
+            # Without an explicit list or a learned route table, do not guess direct.
+            unknown_port = free_port()
+            unknown_config = harness.write("unknown", client_config(
+                "unknown", unavailable_port, pin, socks=unknown_port, open_timeout=2,
+            ))
+            unknown_process = harness.start("unknown", "client", unknown_config)
+            wait_until(lambda: listener_open(unknown_port), "uninitialized default proxy")
+            assert_rejected(lambda: socks_connect(unknown_port, "127.0.0.2", outside.server_port, timeout=5))
+            unknown_process.terminate()
+            unknown_process.wait(timeout=5)
+            print("PASS default selection waits for first route table before classifying direct")
+
+            sleepy_port = free_port()
+            sleepy_config = harness.write("sleepy", client_config(
+                "sleepy", relay_port, pin, socks=sleepy_port, idle=2, sleep_secs=10,
+            ))
+            harness.start("sleepy", "client", sleepy_config)
+            harness.wait_log("sleepy", "WSS connected")
+            before_sleep = len(harness.log("sleepy"))
+            deadline = time.monotonic() + 5
+            while "entering sleep" not in harness.log("sleepy")[before_sleep:]:
+                assert time.monotonic() < deadline, "direct traffic extended WSS activity"
+                assert get_via_socks(sleepy_port, outside.server_port, host="127.0.0.2")
+                time.sleep(0.1)
+            sleeping_offset = len(harness.log("sleepy"))
+            stop = time.monotonic() + 1
+            while time.monotonic() < stop:
+                assert get_via_socks(sleepy_port, outside.server_port, host="127.0.0.2")
+                time.sleep(0.1)
+            sleeping_log = harness.log("sleepy")[sleeping_offset:]
+            assert "WSS connected" not in sleeping_log, "direct traffic woke sleeping WSS"
+            assert "checking pending requests" not in sleeping_log, "direct traffic triggered an early probe"
+            assert get_via_socks(sleepy_port, target_port)
+            harness.wait_log("sleepy", "WSS connected", after=sleeping_offset)
+            print("PASS direct traffic neither delays idle sleep nor wakes WSS; shared traffic wakes")
+
+            # Learned remote routes stay selected after relay loss; only other IPs go direct.
+            relay_process.terminate()
+            relay_process.wait(timeout=5)
+            assert get_via_socks(socks_port, outside.server_port, host="127.0.0.2")
+            assert_rejected(lambda: socks_connect(socks_port, "127.0.0.1", target_port, timeout=15))
+            assert get_via_socks(selected_port, target_port)
+            assert get_via_socks(direct_port, target_port)
+            print("PASS cached routes prevent fallback after relay loss; excluded addresses stay direct")
+
+            for name in ("relay", "home", "office", "selected", "sleepy", "direct"):
                 assert "panicked at" not in harness.log(name), f"panic in {name}"
             print("All NetCrow end-to-end checks passed.")
         except BaseException:

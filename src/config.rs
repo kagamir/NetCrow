@@ -74,8 +74,6 @@ pub struct RelayConfig {
 pub struct PeerConfig {
     pub id: String,
     pub token: String,
-    #[serde(default)]
-    pub allowed_subnets: Vec<IpNet>,
 }
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -105,6 +103,9 @@ pub struct ClientConfig {
     pub relay_url: String,
     #[serde(default)]
     pub shared_subnets: Vec<IpNet>,
+    /// Omitted: all learned remote routes. An explicit empty list selects direct only.
+    #[serde(default)]
+    pub proxy_subnets: Option<Vec<IpNet>>,
     #[serde(default)]
     pub socks5_listen: Option<SocketAddr>,
     #[serde(default)]
@@ -245,7 +246,6 @@ impl RelayConfig {
         for peer in &self.peers {
             identity(&peer.id, &peer.token)?;
             ensure!(ids.insert(&peer.id), "duplicate peer id");
-            ensure!(peer.allowed_subnets.len() <= 64, "too many allowed subnets");
         }
         Ok(())
     }
@@ -345,5 +345,13 @@ mod tests {
         let mut c = client("");
         c.relay_url = "ws://localhost/netcrow".into();
         assert!(c.validate().is_err());
+    }
+    #[test]
+    fn proxy_subnets_distinguish_automatic_and_explicit_selection() {
+        assert!(client("").proxy_subnets.is_none());
+        assert_eq!(client("proxy_subnets=[]").proxy_subnets, Some(vec![]));
+        let configured = client("proxy_subnets=['192.168.1.0/24', 'fd00::/8']");
+        assert!(configured.validate().is_ok());
+        assert_eq!(configured.proxy_subnets.unwrap().len(), 2);
     }
 }

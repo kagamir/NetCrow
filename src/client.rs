@@ -5,6 +5,7 @@ use crate::{
 };
 use anyhow::{anyhow, bail, ensure, Context, Result};
 use futures_util::{SinkExt, StreamExt};
+use ipnet::IpNet;
 use rand::Rng;
 use std::{
     collections::{HashMap, VecDeque},
@@ -34,45 +35,128 @@ struct OpenRequest {
     reply: OpenReply,
 }
 
-/// A bounded, wake-on-demand entry point shared by the local proxy listeners.
+/// A proxy connection owns its actual TCP or multiplexed stream directly.
+/// No detached task is needed to adapt direct traffic to a tunnel-shaped stream.
+pub trait ProxyIo: AsyncRead + AsyncWrite + Send + Unpin {}
+impl<T: AsyncRead + AsyncWrite + Send + Unpin> ProxyIo for T {}
+pub type ProxyStream = Box<dyn ProxyIo>;
+
+/// A bounded, wake-on-demand router shared by SOCKS5 and HTTP listeners.
 #[derive(Clone)]
 pub struct ClientHandle {
     requests: mpsc::Sender<OpenRequest>,
     disabled: watch::Receiver<bool>,
+    routes: watch::Receiver<Option<Vec<Route>>>,
+    proxy_subnets: Option<Arc<[IpNet]>>,
+    own_id: Arc<str>,
     timeout: Duration,
+    connect_timeout: Duration,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum DestinationPolicy {
+    Tunnel(Vec<SocketAddr>),
+    Direct(Vec<SocketAddr>),
+}
+
+/// If any DNS answer is selected, only selected answers may enter the tunnel.
+/// Explicit subnet policy does not depend on whether a route currently exists.
+fn destination_policy(
+    destinations: &[SocketAddr],
+    explicit_subnets: Option<&[IpNet]>,
+    routes: &[Route],
+    own_id: &str,
+) -> DestinationPolicy {
+    let selected: Vec<_> = destinations
+        .iter()
+        .copied()
+        .filter(|destination| match explicit_subnets {
+            Some(subnets) => subnets
+                .iter()
+                .any(|subnet| subnet.contains(&destination.ip())),
+            None => routes
+                .iter()
+                .any(|route| route.peer != own_id && route.subnet.contains(&destination.ip())),
+        })
+        .collect();
+    if selected.is_empty() {
+        DestinationPolicy::Direct(destinations.to_vec())
+    } else {
+        DestinationPolicy::Tunnel(selected)
+    }
 }
 
 impl ClientHandle {
-    /// Resolve locally and request a TCP stream through an advertised remote subnet.
-    /// There is deliberately no direct Internet fallback.
-    pub async fn open(&self, host: &str, port: u16) -> Result<DuplexStream> {
-        ensure!(!*self.disabled.borrow(), "client is remotely disabled");
+    /// Resolve once, tunnel selected subnets, and connect all other IPs locally.
+    /// A selected destination never falls back to a direct connection on failure.
+    pub async fn open(&self, host: &str, port: u16) -> Result<ProxyStream> {
         ensure!(port != 0, "destination port must be nonzero");
         let deadline = Instant::now() + self.timeout;
         time::timeout_at(deadline, async {
             let destinations: Vec<_> = tokio::net::lookup_host((host, port))
                 .await
                 .context("resolve destination")?
-                .take(64)
                 .collect();
             ensure!(!destinations.is_empty(), "destination has no addresses");
-            ensure!(!*self.disabled.borrow(), "client is remotely disabled");
-            let (reply, receiver) = oneshot::channel();
-            self.requests
-                .send(OpenRequest {
-                    destinations,
-                    deadline,
-                    reply,
-                })
-                .await
-                .map_err(|_| anyhow!("client stopped"))?;
-            receiver
-                .await
-                .map_err(|_| anyhow!("connection request cancelled"))?
+            let policy = if let Some(subnets) = &self.proxy_subnets {
+                destination_policy(&destinations, Some(subnets), &[], &self.own_id)
+            } else {
+                // Unknown routes must not turn potentially shared private IPs
+                // into direct traffic. Keep the last snapshot across disconnects.
+                let mut routes = self.routes.clone();
+                loop {
+                    let snapshot = routes.borrow().clone();
+                    if let Some(snapshot) = snapshot {
+                        break destination_policy(&destinations, None, &snapshot, &self.own_id);
+                    }
+                    routes
+                        .changed()
+                        .await
+                        .context("route discovery stopped before first snapshot")?;
+                }
+            };
+            match policy {
+                DestinationPolicy::Direct(destinations) => {
+                    let socket = connect_direct(&destinations, self.connect_timeout).await?;
+                    Ok(Box::new(socket) as ProxyStream)
+                }
+                DestinationPolicy::Tunnel(destinations) => {
+                    ensure!(!*self.disabled.borrow(), "client is remotely disabled");
+                    let (reply, receiver) = oneshot::channel();
+                    self.requests
+                        .send(OpenRequest {
+                            destinations,
+                            deadline,
+                            reply,
+                        })
+                        .await
+                        .map_err(|_| anyhow!("client stopped"))?;
+                    let tunnel = receiver
+                        .await
+                        .map_err(|_| anyhow!("connection request cancelled"))??;
+                    Ok(Box::new(tunnel) as ProxyStream)
+                }
+            }
         })
         .await
         .context("connection request timed out")?
     }
+}
+
+/// The already-resolved addresses are used directly; DNS is never repeated.
+async fn connect_direct(
+    destinations: &[SocketAddr],
+    connect_timeout: Duration,
+) -> Result<TcpStream> {
+    let mut last_error = anyhow!("destination has no addresses");
+    for destination in destinations {
+        match time::timeout(connect_timeout, TcpStream::connect(destination)).await {
+            Ok(Ok(socket)) => return Ok(socket),
+            Ok(Err(error)) => last_error = error.into(),
+            Err(error) => last_error = error.into(),
+        }
+    }
+    Err(last_error).context("direct destination connection failed")
 }
 
 pub async fn run(config: ClientConfig) -> Result<()> {
@@ -80,13 +164,18 @@ pub async fn run(config: ClientConfig) -> Result<()> {
     let tls = crate::tls::client_config(&config.tls)?;
     let disabled = crate::control::spawn(config.control.clone());
     let (requests, receiver) = mpsc::channel(QUEUE_SIZE);
+    let (routes, route_snapshot) = watch::channel(None);
     let handle = ClientHandle {
         requests,
         disabled: disabled.clone(),
+        routes: route_snapshot,
+        proxy_subnets: config.proxy_subnets.clone().map(Arc::from),
+        own_id: Arc::from(config.id.as_str()),
         timeout: Duration::from_secs(config.connection.open_timeout_secs),
+        connect_timeout: Duration::from_secs(config.connection.connect_timeout_secs),
     };
     let proxy = crate::proxy::serve(config.socks5_listen, config.http_listen, handle);
-    let manager = manage(config, tls, receiver, disabled);
+    let manager = manage(config, tls, receiver, disabled, routes);
     tokio::select! {
         result = proxy => result.context("proxy listeners stopped"),
         result = manager => result,
@@ -109,6 +198,7 @@ async fn manage(
     tls: Arc<rustls::ClientConfig>,
     mut requests: mpsc::Receiver<OpenRequest>,
     mut disabled: watch::Receiver<bool>,
+    route_snapshot: watch::Sender<Option<Vec<Route>>>,
 ) -> Result<()> {
     let mut pending = VecDeque::new();
     let mut last_activity = Instant::now();
@@ -172,11 +262,13 @@ async fn manage(
         };
         let outcome = match connection {
             Ok((socket, routes)) => {
+                route_snapshot.send_replace(Some(routes.clone()));
                 tracing::info!("WSS connected");
                 session(
                     &config,
                     socket,
                     routes,
+                    &route_snapshot,
                     &mut pending,
                     &mut requests,
                     &mut disabled,
@@ -346,6 +438,7 @@ async fn session(
     config: &ClientConfig,
     socket: Socket,
     mut routes: Vec<Route>,
+    route_snapshot: &watch::Sender<Option<Vec<Route>>>,
     pending: &mut VecDeque<OpenRequest>,
     requests: &mut mpsc::Receiver<OpenRequest>,
     disabled: &mut watch::Receiver<bool>,
@@ -484,7 +577,10 @@ async fn session(
                             Err(error) => { tracing::warn!(%error, "invalid relay frame"); break SessionExit::Reconnect; }
                         };
                         match frame {
-                            Frame::Routes { routes: updated } => routes = updated,
+                            Frame::Routes { routes: updated } => {
+                                route_snapshot.send_replace(Some(updated.clone()));
+                                routes = updated;
+                            },
                             Frame::Incoming { id, destination } => {
                                 if id % 2 != 0 || streams.contains_key(&id) { break SessionExit::Reconnect; }
                                 if streams.len() >= config.connection.max_streams || destination.port() == 0 || !config.shared_subnets.iter().any(|net| net.contains(&destination.ip())) {
@@ -708,6 +804,239 @@ mod tests {
             ),
             Some("192.168.10.1:80".parse().unwrap())
         );
+    }
+
+    struct RoutingHarness {
+        handle: ClientHandle,
+        requests: mpsc::Receiver<OpenRequest>,
+        routes: watch::Sender<Option<Vec<Route>>>,
+        disabled: watch::Sender<bool>,
+    }
+
+    fn routing_harness(
+        explicit: Option<Vec<IpNet>>,
+        snapshot: Option<Vec<Route>>,
+        disabled: bool,
+    ) -> RoutingHarness {
+        let (requests, receiver) = mpsc::channel(QUEUE_SIZE);
+        let (routes, snapshot) = watch::channel(snapshot);
+        let (disabled, state) = watch::channel(disabled);
+        RoutingHarness {
+            handle: ClientHandle {
+                requests,
+                disabled: state,
+                routes: snapshot,
+                proxy_subnets: explicit.map(Arc::from),
+                own_id: Arc::from("me"),
+                timeout: Duration::from_secs(2),
+                connect_timeout: Duration::from_millis(200),
+            },
+            requests: receiver,
+            routes,
+            disabled,
+        }
+    }
+
+    #[test]
+    fn policy_prefers_selected_dns_answers_and_distinguishes_empty_override() {
+        let destinations: Vec<SocketAddr> = [
+            "8.8.8.8:443",
+            "10.0.0.1:443",
+            "192.168.10.1:443",
+            "[fd00::1]:443",
+        ]
+        .into_iter()
+        .map(|value| value.parse().unwrap())
+        .collect();
+        let routes = vec![
+            Route {
+                peer: "me".into(),
+                subnet: "10.0.0.0/8".parse().unwrap(),
+                online: true,
+            },
+            Route {
+                peer: "other".into(),
+                subnet: "192.168.10.0/24".parse().unwrap(),
+                online: false,
+            },
+            Route {
+                peer: "other".into(),
+                subnet: "fd00::/64".parse().unwrap(),
+                online: false,
+            },
+        ];
+        assert_eq!(
+            destination_policy(&destinations, None, &routes, "me"),
+            DestinationPolicy::Tunnel(destinations[2..].to_vec())
+        );
+        assert_eq!(
+            destination_policy(&destinations[..2], None, &routes, "me"),
+            DestinationPolicy::Direct(destinations[..2].to_vec())
+        );
+        assert_eq!(
+            destination_policy(&destinations, Some(&[]), &routes, "me"),
+            DestinationPolicy::Direct(destinations.clone())
+        );
+        let explicit = ["10.0.0.0/8".parse().unwrap()];
+        assert_eq!(
+            destination_policy(&destinations, Some(&explicit), &[], "me"),
+            DestinationPolicy::Tunnel(vec![destinations[1]])
+        );
+    }
+
+    #[tokio::test]
+    async fn explicit_direct_works_without_routes_or_wake_and_survives_disable() {
+        time::timeout(Duration::from_secs(5), async {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let destination = listener.local_addr().unwrap();
+            let mut harness =
+                routing_harness(Some(vec!["10.0.0.0/8".parse().unwrap()]), None, false);
+            let (client, server) = tokio::join!(
+                harness.handle.open("127.0.0.1", destination.port()),
+                listener.accept()
+            );
+            let mut client = client.unwrap();
+            let (mut server, _) = server.unwrap();
+            harness.disabled.send_replace(true);
+            client.write_all(b"existing direct stream").await.unwrap();
+            let mut received = [0; 22];
+            server.read_exact(&mut received).await.unwrap();
+            assert_eq!(&received, b"existing direct stream");
+            let (client, server) = tokio::join!(
+                harness.handle.open("127.0.0.1", destination.port()),
+                listener.accept()
+            );
+            assert!(
+                client.is_ok(),
+                "disabled tunnels must not disable direct routing"
+            );
+            assert!(server.is_ok());
+            assert!(
+                matches!(
+                    harness.requests.try_recv(),
+                    Err(mpsc::error::TryRecvError::Empty)
+                ),
+                "direct traffic must not wake the connection manager"
+            );
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn default_waits_for_snapshot_and_keeps_selected_cache_after_disconnect() {
+        time::timeout(Duration::from_secs(5), async {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let destination = listener.local_addr().unwrap();
+            let mut harness = routing_harness(None, None, false);
+            let handle = harness.handle.clone();
+            let opening =
+                tokio::spawn(async move { handle.open("127.0.0.1", destination.port()).await });
+            time::sleep(Duration::from_millis(20)).await;
+            assert!(
+                !opening.is_finished(),
+                "unknown routes must not become direct traffic"
+            );
+            assert!(matches!(
+                harness.requests.try_recv(),
+                Err(mpsc::error::TryRecvError::Empty)
+            ));
+            harness.routes.send_replace(Some(vec![Route {
+                peer: "other".into(),
+                subnet: "127.0.0.1/32".parse().unwrap(),
+                online: false,
+            }]));
+            let request = harness.requests.recv().await.unwrap();
+            assert_eq!(request.destinations, vec![destination]);
+            request.reply.send(Err(anyhow!("remote unavailable"))).ok();
+            assert!(opening.await.unwrap().is_err());
+            drop(harness.routes);
+            let handle = harness.handle.clone();
+            let opening =
+                tokio::spawn(async move { handle.open("127.0.0.1", destination.port()).await });
+            let request = harness.requests.recv().await.unwrap();
+            request
+                .reply
+                .send(Err(anyhow!("route no longer available")))
+                .ok();
+            assert!(opening.await.unwrap().is_err());
+            assert!(
+                time::timeout(Duration::from_millis(25), listener.accept())
+                    .await
+                    .is_err(),
+                "selected errors must never fall back to direct TCP"
+            );
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn explicit_selected_without_route_is_tunnel_only_and_disable_rejects_it() {
+        time::timeout(Duration::from_secs(5), async {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let destination = listener.local_addr().unwrap();
+            let mut harness = routing_harness(
+                Some(vec!["127.0.0.1/32".parse().unwrap()]),
+                Some(vec![]),
+                false,
+            );
+            let handle = harness.handle.clone();
+            let opening =
+                tokio::spawn(async move { handle.open("127.0.0.1", destination.port()).await });
+            let request = harness.requests.recv().await.unwrap();
+            assert_eq!(request.destinations, vec![destination]);
+            request.reply.send(Err(anyhow!("no advertised route"))).ok();
+            assert!(opening.await.unwrap().is_err());
+            harness.disabled.send_replace(true);
+            let error = harness
+                .handle
+                .open("127.0.0.1", destination.port())
+                .await
+                .err()
+                .expect("selected disabled destination must fail");
+            assert!(error.to_string().contains("disabled"));
+            assert!(matches!(
+                harness.requests.try_recv(),
+                Err(mpsc::error::TryRecvError::Empty)
+            ));
+            assert!(time::timeout(Duration::from_millis(25), listener.accept())
+                .await
+                .is_err());
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn default_unknown_route_snapshot_obeys_open_timeout() {
+        let mut harness = routing_harness(None, None, true);
+        let started = Instant::now();
+        let error = harness
+            .handle
+            .open("127.0.0.1", 9)
+            .await
+            .err()
+            .expect("unknown routes must time out");
+        assert!(error.to_string().contains("timed out"));
+        assert_eq!(started.elapsed(), Duration::from_secs(2));
+        assert!(matches!(
+            harness.requests.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+    }
+
+    #[tokio::test]
+    async fn direct_retries_already_resolved_candidates() {
+        let unavailable = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let first = unavailable.local_addr().unwrap();
+        let available = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let second = available.local_addr().unwrap();
+        drop(unavailable);
+        let stream = connect_direct(&[first, second], Duration::from_millis(200))
+            .await
+            .unwrap();
+        assert_eq!(stream.peer_addr().unwrap(), second);
     }
 
     #[tokio::test]

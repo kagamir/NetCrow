@@ -141,13 +141,6 @@ impl State {
             "authentication failed"
         );
         ensure!(
-            subnets.iter().all(|n| peer
-                .allowed_subnets
-                .iter()
-                .any(|allowed| contains_subnet(allowed, n))),
-            "advertisement outside allowed_subnets"
-        );
-        ensure!(
             !self.peers.get(id).is_some_and(|p| p.session.is_some()),
             "peer already connected"
         );
@@ -526,10 +519,6 @@ impl State {
         }
     }
 }
-fn contains_subnet(allowed: &IpNet, claimed: &IpNet) -> bool {
-    allowed.prefix_len() <= claimed.prefix_len() && allowed.contains(&claimed.network())
-}
-
 /// Start the TLS/WebSocket relay and run until interrupted.
 pub async fn run(config: RelayConfig) -> Result<()> {
     config.validate()?;
@@ -748,15 +737,12 @@ pending_timeout_secs = 2
 [[peers]]
 id = "a"
 token = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-allowed_subnets = ["10.0.0.0/8"]
 [[peers]]
 id = "b"
 token = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
-allowed_subnets = ["10.0.0.0/8"]
 [[peers]]
 id = "c"
 token = "cccccccccccccccccccccccccccccccc"
-allowed_subnets = []
 "#,
         )
         .unwrap();
@@ -789,19 +775,51 @@ allowed_subnets = []
         assert_eq!(state.choose_peer("a", "10.2.2.3".parse().unwrap()), None);
     }
     #[test]
-    fn authentication_and_subnet_boundaries() {
+    fn authenticated_clients_can_advertise_arbitrary_subnets() {
         let state = state();
         let token = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let subnets = [
+            "10.1.0.0/16",
+            "192.168.5.0/24",
+            "2001:db8::/32",
+            "0.0.0.0/0",
+            "::/0",
+        ]
+        .map(|subnet| subnet.parse().unwrap());
+        assert!(state.authenticate(VERSION, "a", token, &subnets).is_ok());
+        assert!(state.authenticate(VERSION, "a", "wrong", &subnets).is_err());
         assert!(state
-            .authenticate(VERSION, "a", token, &["10.1.0.0/16".parse().unwrap()])
-            .is_ok());
-        assert!(state.authenticate(VERSION, "a", "wrong", &[]).is_err());
-        assert!(state
-            .authenticate(VERSION, "a", token, &["0.0.0.0/0".parse().unwrap()])
+            .authenticate(VERSION, "unknown", token, &subnets)
             .is_err());
         assert!(state
-            .authenticate(VERSION, "a", token, &["::/0".parse().unwrap()])
+            .authenticate(VERSION + 1, "a", token, &subnets)
             .is_err());
+        assert!(state
+            .authenticate(
+                VERSION,
+                "a",
+                token,
+                &vec!["10.0.0.0/8".parse().unwrap(); 65]
+            )
+            .is_err());
+    }
+    #[test]
+    fn default_routes_cover_both_ip_families_and_specific_routes_take_precedence() {
+        let mut state = state();
+        let (_, _a) = register(&mut state, "a", &["0.0.0.0/0", "::/0"]);
+        let (_, _b) = register(&mut state, "b", &["10.1.0.0/16", "2001:db8::/32"]);
+        for address in ["198.51.100.1", "2001:4860::8888"] {
+            assert_eq!(
+                state.choose_peer("c", address.parse().unwrap()),
+                Some("a".into())
+            );
+        }
+        for address in ["10.1.2.3", "2001:db8::1234"] {
+            assert_eq!(
+                state.choose_peer("c", address.parse().unwrap()),
+                Some("b".into())
+            );
+        }
     }
     #[test]
     fn offline_pending_delivered_after_welcome_and_removed_with_source() {

@@ -3,6 +3,9 @@ id = "home"
 token = "REPLACE_WITH_RANDOM_HOME_TOKEN_AT_LEAST_32_BYTES"
 relay_url = "wss://relay.example.com/netcrow"
 shared_subnets = []
+# 省略 proxy_subnets：远端共享子网经中继，其余目的地址本机直连。
+# 显式列表：仅列表内地址经中继，其余直连；空列表 [] 表示全部直连。
+# proxy_subnets = ["192.168.1.0/24"]
 socks5_listen = "127.0.0.1:1080"
 http_listen = "127.0.0.1:8080"
 allow_remote_proxy = false

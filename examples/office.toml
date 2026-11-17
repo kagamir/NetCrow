@@ -2,6 +2,7 @@
 id = "office"
 token = "REPLACE_WITH_RANDOM_OFFICE_TOKEN_AT_LEAST_32_BYTES"
 relay_url = "wss://relay.example.com/netcrow"
+# shared_subnets 是本机对外共享范围，与代理分流用的 proxy_subnets 不同。
 shared_subnets = ["192.168.1.0/24"]
 
 [tls]
