@@ -37,6 +37,9 @@ pub fn server_config(config: &ServerTls) -> Result<Arc<rustls::ServerConfig>> {
     let key = rustls_pemfile::private_key(&mut reader)
         .context("parse TLS private key")?
         .context("TLS private key file contains no private key")?;
+    // A single configured identity is presented regardless of the client's SNI,
+    // including connections which omit SNI entirely. Client verification remains
+    // responsible for checking the expected hostname or the provisioned key pin.
     let mut tls = rustls::ServerConfig::builder_with_provider(Arc::new(ring::default_provider()))
         .with_safe_default_protocol_versions()?
         .with_no_client_auth()
@@ -77,6 +80,18 @@ pub fn client_config(config: &ClientTls) -> Result<Arc<rustls::ClientConfig>> {
     };
     tls.alpn_protocols = vec![b"http/1.1".to_vec()];
     Ok(Arc::new(tls))
+}
+
+/// Configure ClientHello SNI independently from the TLS verification identity.
+/// The connector must still receive the endpoint's ServerName, even with SNI
+/// disabled; turning off SNI never disables hostname, CA or public-key checks.
+pub fn client_config_for_relay(
+    config: &ClientTls,
+    enable_sni: bool,
+) -> Result<Arc<rustls::ClientConfig>> {
+    let mut tls = client_config(config)?;
+    Arc::make_mut(&mut tls).enable_sni = enable_sni;
+    Ok(tls)
 }
 
 /// Return the leaf certificate's public-key fingerprint in `sha256/BASE64`
@@ -309,14 +324,30 @@ mod tests {
         client: Arc<rustls::ClientConfig>,
         name: &'static str,
     ) -> bool {
+        handshake_observed_sni(server, client, ServerName::try_from(name).unwrap())
+            .await
+            .is_ok()
+    }
+
+    async fn handshake_observed_sni(
+        server: Arc<rustls::ServerConfig>,
+        client: Arc<rustls::ClientConfig>,
+        name: ServerName<'static>,
+    ) -> Result<Option<String>> {
         let (server_io, client_io) = tokio::io::duplex(64 * 1024);
         let acceptor = tokio_rustls::TlsAcceptor::from(server);
         let connector = tokio_rustls::TlsConnector::from(client);
-        let (server, client) = tokio::join!(
-            acceptor.accept(server_io),
-            connector.connect(ServerName::try_from(name).unwrap(), client_io)
-        );
-        server.is_ok() && client.is_ok()
+        let (server, client) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            tokio::join!(
+                acceptor.accept(server_io),
+                connector.connect(name, client_io)
+            )
+        })
+        .await
+        .context("test TLS handshake timed out")?;
+        client.context("client TLS handshake")?;
+        let server = server.context("server TLS handshake")?;
+        Ok(server.get_ref().1.server_name().map(str::to_owned))
     }
 
     #[tokio::test]
@@ -333,12 +364,46 @@ mod tests {
         // Pinning explicitly authenticates the configured key, even when the URL
         // uses an IP or hostname outside the generated certificate's SANs.
         assert!(handshake(server.clone(), good, "different.example").await);
-        let bad = client_config(&ClientTls {
-            spki_sha256: Some(format!("sha256/{}", STANDARD.encode([0; 32]))),
+        for enable_sni in [true, false] {
+            let bad = client_config_for_relay(
+                &ClientTls {
+                    spki_sha256: Some(format!("sha256/{}", STANDARD.encode([0; 32]))),
+                    ca_cert_path: None,
+                },
+                enable_sni,
+            )
+            .unwrap();
+            assert!(!handshake(server.clone(), bad, "localhost").await);
+        }
+    }
+
+    #[tokio::test]
+    async fn relay_accepts_default_custom_absent_and_ip_sni() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = identity(dir.path());
+        let server = server_config(&config).unwrap();
+        let trust = ClientTls {
+            spki_sha256: Some(certificate_pin(&config.cert_path).unwrap()),
             ca_cert_path: None,
-        })
-        .unwrap();
-        assert!(!handshake(server, bad, "localhost").await);
+        };
+        for (name, enable_sni, expected) in [
+            ("localhost", true, Some("localhost")),
+            ("custom.example", true, Some("custom.example")),
+            ("localhost", false, None),
+            ("127.0.0.1", true, None),
+            ("::1", true, None),
+        ] {
+            let client = client_config_for_relay(&trust, enable_sni).unwrap();
+            let observed =
+                handshake_observed_sni(server.clone(), client, ServerName::try_from(name).unwrap())
+                    .await
+                    .unwrap();
+            assert_eq!(
+                observed.as_deref(),
+                expected,
+                "name={name}, SNI={enable_sni}"
+            );
+        }
     }
 
     #[derive(Debug)]
@@ -402,6 +467,32 @@ mod tests {
         })
         .unwrap();
         assert!(handshake(server.clone(), client.clone(), "localhost").await);
+        assert!(!handshake(server, client, "other.example").await);
+    }
+
+    #[tokio::test]
+    async fn disabling_sni_keeps_ca_hostname_verification() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = identity(dir.path());
+        let server = server_config(&config).unwrap();
+        let client = client_config_for_relay(
+            &ClientTls {
+                spki_sha256: None,
+                ca_cert_path: Some(config.cert_path),
+            },
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            handshake_observed_sni(
+                server.clone(),
+                client.clone(),
+                ServerName::try_from("localhost").unwrap(),
+            )
+            .await
+            .unwrap(),
+            None,
+        );
         assert!(!handshake(server, client, "other.example").await);
     }
 }

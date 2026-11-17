@@ -1,9 +1,10 @@
 use anyhow::{bail, ensure, Context, Result};
 use ipnet::IpNet;
+use rustls::pki_types::ServerName;
 use serde::Deserialize;
 use std::{
     collections::HashSet,
-    net::SocketAddr,
+    net::{IpAddr, Ipv6Addr, SocketAddr},
     path::{Path, PathBuf},
 };
 
@@ -100,7 +101,11 @@ impl Default for ServerTls {
 pub struct ClientConfig {
     pub id: String,
     pub token: String,
-    pub relay_url: String,
+    /// Dial address and literal WebSocket path, e.g. relay.example.com:443/netcrow.
+    pub relay_addr: String,
+    /// Omitted: verify the dial host. Empty: omit SNI but still verify that host.
+    #[serde(default)]
+    pub relay_sni: Option<String>,
     #[serde(default)]
     pub shared_subnets: Vec<IpNet>,
     /// Omitted: all learned remote routes. An explicit empty list selects direct only.
@@ -119,6 +124,16 @@ pub struct ClientConfig {
     #[serde(default)]
     pub control: Option<ControlConfig>,
 }
+/// Separates the TCP/WebSocket destination from TLS identity and SNI policy.
+#[derive(Debug, Clone)]
+pub struct RelayEndpoint {
+    pub host: String,
+    pub port: u16,
+    pub websocket_uri: String,
+    pub server_name: ServerName<'static>,
+    pub enable_sni: bool,
+}
+
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ClientTls {
@@ -247,18 +262,138 @@ impl RelayConfig {
         Ok(())
     }
 }
+fn normalize_host(value: &str) -> Result<String> {
+    ensure!(
+        !value.is_empty()
+            && !value.chars().any(|c| c.is_whitespace() || c.is_control())
+            && !value.contains(['/', '?', '#', '@', '\\', '%', '[', ']']),
+        "host must be a DNS name or an unbracketed IP address"
+    );
+    let host = if let Ok(address) = value.parse::<IpAddr>() {
+        address.to_string()
+    } else {
+        ensure!(
+            !value.contains(':'),
+            "host names must not contain a scheme or port"
+        );
+        url::Host::parse(value)
+            .context("invalid DNS name or IP address")?
+            .to_string()
+    };
+    ServerName::try_from(host.clone()).context("invalid TLS host identity")?;
+    Ok(host)
+}
+
+fn validate_websocket_path(value: &str) -> Result<()> {
+    ensure!(value.starts_with('/'), "WebSocket path must begin with /");
+    let bytes = value.as_bytes();
+    let mut position = 0;
+    while position < bytes.len() {
+        let byte = bytes[position];
+        if byte == b'%' {
+            ensure!(
+                position + 2 < bytes.len()
+                    && bytes[position + 1].is_ascii_hexdigit()
+                    && bytes[position + 2].is_ascii_hexdigit(),
+                "WebSocket path contains an invalid percent escape"
+            );
+            position += 3;
+        } else {
+            ensure!(
+                byte.is_ascii_alphanumeric() || b"/-._~!$&'()*+,;=:@".contains(&byte),
+                "WebSocket path must use URI path characters; percent-encode other bytes"
+            );
+            position += 1;
+        }
+    }
+    Ok(())
+}
+
 impl ClientConfig {
+    pub fn relay_endpoint(&self) -> Result<RelayEndpoint> {
+        ensure!(
+            !self.relay_addr.chars().any(|c| c.is_whitespace() || c.is_control())
+                && !self.relay_addr.contains(['?', '#', '\\']),
+            "relay_addr must be host:port/path without scheme, credentials, whitespace, query or fragment"
+        );
+        let (authority, suffix) = self
+            .relay_addr
+            .split_once('/')
+            .context("relay_addr must include an explicit port and a path beginning with /")?;
+        ensure!(
+            !authority.contains('@'),
+            "relay_addr must not contain credentials"
+        );
+        let websocket_path = format!("/{suffix}");
+        validate_websocket_path(&websocket_path)?;
+        let (host, port_text) = if let Some(bracketed) = authority.strip_prefix('[') {
+            let (literal, remainder) = bracketed
+                .split_once(']')
+                .context("relay_addr IPv6 addresses must use [address]:port/path")?;
+            let address: Ipv6Addr = literal.parse().context("invalid relay_addr IPv6 address")?;
+            let port = remainder
+                .strip_prefix(':')
+                .context("relay_addr must include an explicit port")?;
+            (address.to_string(), port)
+        } else {
+            let (host, port) = authority
+                .rsplit_once(':')
+                .context("relay_addr must include an explicit port")?;
+            ensure!(
+                !host.contains(':') && !host.contains(['[', ']']),
+                "relay_addr IPv6 addresses must use [address]:port/path"
+            );
+            (
+                normalize_host(host).context("invalid relay_addr host")?,
+                port,
+            )
+        };
+        ensure!(
+            !port_text.is_empty() && port_text.bytes().all(|byte| byte.is_ascii_digit()),
+            "relay_addr port must be an integer from 1 to 65535"
+        );
+        let port: u16 = port_text
+            .parse()
+            .context("relay_addr port must be from 1 to 65535")?;
+        ensure!(port != 0, "relay_addr port must be from 1 to 65535");
+        let authority_host = if host.parse::<Ipv6Addr>().is_ok() {
+            format!("[{host}]")
+        } else {
+            host.clone()
+        };
+        // Construct from the parsed authority, without URL path normalization.
+        // In particular, keep :443, dot segments and percent-encoded bytes intact.
+        let websocket_uri = format!("wss://{authority_host}:{port}{websocket_path}");
+        let uri: tokio_tungstenite::tungstenite::http::Uri = websocket_uri
+            .parse()
+            .context("relay_addr does not produce a valid WebSocket URI")?;
+        ensure!(
+            uri.scheme_str() == Some("wss")
+                && uri
+                    .path_and_query()
+                    .is_some_and(|path| path.as_str() == websocket_path),
+            "relay_addr must preserve its literal WebSocket path"
+        );
+        let identity = match self.relay_sni.as_deref() {
+            Some(override_name) if !override_name.is_empty() => {
+                normalize_host(override_name).context("invalid relay_sni name")?
+            }
+            _ => host.clone(),
+        };
+        let server_name = ServerName::try_from(identity)
+            .context("TLS identity must be a valid DNS name or IP address")?;
+        Ok(RelayEndpoint {
+            host,
+            port,
+            websocket_uri,
+            server_name,
+            enable_sni: self.relay_sni.as_deref() != Some(""),
+        })
+    }
+
     pub fn validate(&self) -> Result<()> {
         identity(&self.id)?;
-        let url = url::Url::parse(&self.relay_url)?;
-        ensure!(
-            url.scheme() == "wss"
-                && url.host_str().is_some()
-                && url.username().is_empty()
-                && url.password().is_none()
-                && url.fragment().is_none(),
-            "relay_url must be a wss URL without credentials or fragment"
-        );
+        self.relay_endpoint()?;
         ensure!(self.shared_subnets.len() <= 64, "too many shared subnets");
         for addr in [self.socks5_listen, self.http_listen].into_iter().flatten() {
             ensure!(
@@ -322,7 +457,7 @@ impl ClientConfig {
 mod tests {
     use super::*;
     fn client(text: &str) -> ClientConfig {
-        toml::from_str(&format!("id='home'\ntoken='0123456789abcdef0123456789abcdef'\nrelay_url='wss://localhost/netcrow'\n{text}")).unwrap()
+        toml::from_str(&format!("id='home'\ntoken='0123456789abcdef0123456789abcdef'\nrelay_addr='localhost:443/netcrow'\n{text}")).unwrap()
     }
     #[test]
     fn idle_zero_keeps_other_liveness_limits() {
@@ -346,10 +481,159 @@ mod tests {
         assert!(toml::from_str::<ConnectionConfig>("idle_sec=0").is_err());
     }
     #[test]
-    fn plaintext_relay_is_rejected() {
-        let mut c = client("");
-        c.relay_url = "ws://localhost/netcrow".into();
-        assert!(c.validate().is_err());
+    fn relay_endpoints_preserve_explicit_ports_and_literal_paths() {
+        let default = client("").relay_endpoint().unwrap();
+        assert_eq!(default.host, "localhost");
+        assert_eq!(default.port, 443);
+        assert_eq!(default.websocket_uri, "wss://localhost:443/netcrow");
+        assert_eq!(default.server_name.to_str(), "localhost");
+        assert!(default.enable_sni);
+        for (address, host, port, uri) in [
+            (
+                "EXAMPLE.COM:443/",
+                "example.com",
+                443,
+                "wss://example.com:443/",
+            ),
+            (
+                "127.0.0.1:8443/tunnel",
+                "127.0.0.1",
+                8443,
+                "wss://127.0.0.1:8443/tunnel",
+            ),
+            (
+                "[2001:0db8::1]:65535/a/../%2f%2E/",
+                "2001:db8::1",
+                65535,
+                "wss://[2001:db8::1]:65535/a/../%2f%2E/",
+            ),
+            (
+                "bücher.example:1/socket",
+                "xn--bcher-kva.example",
+                1,
+                "wss://xn--bcher-kva.example:1/socket",
+            ),
+            (
+                "example.com:443/a@b/http://x",
+                "example.com",
+                443,
+                "wss://example.com:443/a@b/http://x",
+            ),
+        ] {
+            let mut config = client("");
+            config.relay_addr = address.into();
+            let endpoint = config.relay_endpoint().unwrap();
+            assert_eq!(endpoint.host, host);
+            assert_eq!(endpoint.port, port);
+            assert_eq!(endpoint.websocket_uri, uri);
+            assert_eq!(endpoint.server_name.to_str(), host);
+        }
+    }
+
+    #[test]
+    fn sni_override_and_disabled_sni_keep_independent_certificate_identity() {
+        let mut config = client("");
+        config.relay_addr = "127.0.0.1:443/netcrow".into();
+        let default = config.relay_endpoint().unwrap();
+        assert!(matches!(default.server_name, ServerName::IpAddress(_)));
+        config.relay_sni = Some("RELAY.EXAMPLE.COM".into());
+        let overridden = config.relay_endpoint().unwrap();
+        assert!(overridden.enable_sni);
+        assert_eq!(overridden.server_name.to_str(), "relay.example.com");
+        assert_eq!(overridden.host, "127.0.0.1");
+        assert_eq!(overridden.websocket_uri, "wss://127.0.0.1:443/netcrow");
+        config.relay_sni = Some(String::new());
+        let omitted = config.relay_endpoint().unwrap();
+        assert!(!omitted.enable_sni);
+        assert_eq!(omitted.server_name, default.server_name);
+        config.relay_addr = "Example.com:443/netcrow".into();
+        let omitted = config.relay_endpoint().unwrap();
+        assert!(!omitted.enable_sni);
+        assert_eq!(omitted.server_name.to_str(), "example.com");
+        config.relay_sni = Some("2001:db8::2".into());
+        let ip_override = config.relay_endpoint().unwrap();
+        assert!(matches!(ip_override.server_name, ServerName::IpAddress(_)));
+        assert_eq!(ip_override.host, "example.com");
+    }
+
+    #[test]
+    fn invalid_relay_addresses_and_paths_are_rejected() {
+        for address in [
+            "",
+            "localhost",
+            "localhost/netcrow",
+            "localhost:443",
+            "localhost:/netcrow",
+            "localhost:0/netcrow",
+            "localhost:65536/netcrow",
+            "localhost:+443/netcrow",
+            "localhost:-1/netcrow",
+            ":443/netcrow",
+            "user@localhost:443/netcrow",
+            "user:pass@localhost:443/netcrow",
+            "wss://localhost:443/netcrow",
+            "ws://localhost:443/netcrow",
+            "2001:db8::1:443/netcrow",
+            "[::1]/netcrow",
+            "[::1]:443:80/netcrow",
+            "[127.0.0.1]:443/netcrow",
+            "[fe80::1%eth0]:443/netcrow",
+            " localhost:443/netcrow",
+            "localhost:443/netcrow ",
+            "localhost:443/a\nb",
+            "localhost:443/a\rb",
+            "localhost:443/a\tb",
+            "localhost:443/path?query",
+            "localhost:443/path#fragment",
+            "localhost:443/path\\other",
+            "localhost:443/%",
+            "localhost:443/%0",
+            "localhost:443/%GG",
+            "localhost:443/路径",
+            "localhost:443/<path>",
+            "localhost:443/{path}",
+            "bad..host:443/netcrow",
+            "%6cocalhost:443/netcrow",
+        ] {
+            let mut config = client("");
+            config.relay_addr = address.into();
+            assert!(
+                config.validate().is_err(),
+                "accepted invalid address {address:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_sni_overrides_and_removed_fields_are_rejected() {
+        for name in [
+            " ",
+            "relay.example:443",
+            "https://relay.example",
+            "bad..host",
+            "[::1]",
+            "a/b",
+            "a?b",
+            "a#b",
+            "a\nb",
+            "a\0b",
+        ] {
+            let mut config = client("");
+            config.relay_sni = Some(name.into());
+            assert!(config.validate().is_err(), "accepted invalid SNI {name:?}");
+        }
+        for removed in [
+            "relay_url='wss://localhost/netcrow'",
+            "relay_path='/netcrow'",
+        ] {
+            assert!(toml::from_str::<ClientConfig>(&format!(
+                "id='home'\ntoken=''\nrelay_addr='localhost:443/netcrow'\n{removed}"
+            ))
+            .is_err());
+        }
+        assert!(
+            toml::from_str::<ClientConfig>("id='home'\ntoken=''\nrelay_sni='localhost'").is_err()
+        );
     }
     #[test]
     fn tokens_preserve_arbitrary_utf8_without_length_limits() {
@@ -361,7 +645,7 @@ mod tests {
         ] {
             let literal = toml::Value::String(token.clone()).to_string();
             let client: ClientConfig = toml::from_str(&format!(
-                "id='home'\ntoken={literal}\nrelay_url='wss://localhost/netcrow'"
+                "id='home'\ntoken={literal}\nrelay_addr='localhost:443/netcrow'"
             ))
             .unwrap();
             let relay: RelayConfig = toml::from_str(&format!(

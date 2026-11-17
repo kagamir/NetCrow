@@ -21,8 +21,8 @@ cargo build --release --locked
 | 家庭电脑 | [home.toml](examples/home.toml) | 提供 SOCKS5 `127.0.0.1:1080` 和 HTTP `127.0.0.1:8080` 代理 |
 
 1. 为每个客户端设置独立 Token（可用 `openssl rand -hex 32` 生成），替换客户端和中继 `[[peers]]` 中对应的占位符。双方填写相同的原始字符串，程序自动计算 SHA-256 用于认证。
-2. 在公网服务器运行 `./netcrow relay --config relay.toml`。默认自动生成并保存自签证书和私钥；以后启动复用。只存在其中一个文件时拒绝启动。443 需要相应绑定权限，也可改用 8443 并同步修改客户端 URL。
-3. 另开终端运行 `./netcrow fingerprint --cert netcrow-cert.pem`，通过可信渠道把输出填入两个客户端的 `tls.spki_sha256`，并修改 `relay_url` 为实际中继地址。
+2. 在公网服务器运行 `./netcrow relay --config relay.toml`。默认自动生成并保存自签证书和私钥；以后启动复用。只存在其中一个文件时拒绝启动。443 需要相应绑定权限，也可改用 8443 并同步修改客户端 `relay_addr` 中的端口。
+3. 另开终端运行 `./netcrow fingerprint --cert netcrow-cert.pem`，通过可信渠道把输出填入两个客户端的 `tls.spki_sha256`，并修改 `relay_addr` 为实际中继地址，例如 `relay.example.com:443/netcrow`。
 4. 公司电脑运行 `./netcrow client --config office.toml`；家庭电脑运行 `./netcrow client --config home.toml`。
 
 应用设置本地代理后即可访问，例如：
@@ -128,7 +128,10 @@ token = "REPLACE_WITH_RANDOM_HOME_TOKEN"
 ```toml
 id = "home"                 # 必填：规则同中继 peers.id，且须与中继登记一致
 token = "REPLACE_WITH_RANDOM_HOME_TOKEN" # 必填：须与中继登记一致
-relay_url = "wss://relay.example.com/netcrow" # 必填：wss URL，不含账号、密码或片段
+relay_addr = "relay.example.com:443/netcrow" # 必填：域名:端口/路径 或 IP:端口/路径，不带协议前缀
+# relay_addr = "[2001:db8::1]:443/netcrow"    # IPv6 地址须加方括号；路径须与中继 websocket_path 一致
+# relay_sni = "relay.example.com" # 默认省略：使用 relay_addr 中的域名或 IP；也可指定其他域名或 IP
+# relay_sni = ""                 # 显式空字符串：不发送 TLS SNI；与上一行二选一
 shared_subnets = []          # 默认：不共享子网；最多 64 个 IPv4 / IPv6 CIDR
 # shared_subnets = ["192.168.1.0/24"] # 替换上一行可共享此网段
 
@@ -180,6 +183,10 @@ enable = []                 # 默认：无恢复规则；仅配置此组时，�
 
 `token` 支持任意 UTF-8 字符串，不限制长度，也允许空字符串；引号、换行等按 TOML 字符串语法转义。解析后的原文直接计算 SHA-256，使用其 64 个小写十六进制字符组成的摘要认证，不裁剪空白、不做 Unicode 归一化，配置中无需预先哈希。此认证方式使用协议版本 2，客户端和中继必须一起升级，旧版本无法互连。
 
+`relay_addr` 始终通过 WSS 连接，必须包含端口和以 `/` 开头的路径，不接受协议前缀、账号密码、查询参数或片段。实际 TCP 连接地址、HTTP `Host` 和 WebSocket 路径均取自它；路径按原样发送，非 ASCII 字符须使用百分号编码。旧配置中的 `relay_url` 已移除，例如 `wss://relay.example.com/netcrow` 应改为 `relay_addr = "relay.example.com:443/netcrow"`。
+
+`relay_sni` 独立控制 TLS 名称：省略时使用连接目标的域名或 IP，非空时使用指定名称，空字符串时关闭 SNI 发送。CA 模式按非空 `relay_sni` 验证证书名称；省略或为空时按连接目标验证，关闭 SNI 不会关闭证书验证。IP 名称用于验证证书中的 IP，按 TLS 标准不作为 SNI 扩展发送。中继使用配置的证书兼容默认、自定义和无 SNI 连接；指纹模式仍校验公钥、有效期与握手签名。
+
 ## 连接与休眠
 
 发起中继请求或传输业务字节算活动，心跳、路由更新、定期检查和直连流量不算。本机中继请求立即唤醒本机；远端休眠时，中继暂存新连接请求，等待其下次上线。默认 10 分钟无活动后休眠，每隔约 10 秒上线检查。中继 `pending_timeout_secs` 与发起方 `open_timeout_secs` 应大于远端 `sleep_secs` 并预留连接时间。
@@ -204,7 +211,7 @@ enable = []                 # 默认：无恢复规则；仅配置此组时，�
 
 ## 证书与边界
 
-自签模式使用 `sha256/<Base64>` 格式的 **SPKI 公钥指纹**，检查有效期和 TLS 握手签名；更换私钥需更新指纹。机构签发证书配置中继 `tls.cert_path` / `tls.key_path`，客户端删除 `tls.spki_sha256` 并通过证书覆盖的域名连接。私有 CA 可配置 `tls.ca_cert_path`，不能与指纹同时使用。相对证书路径以配置文件目录为准。
+自签模式使用 `sha256/<Base64>` 格式的 **SPKI 公钥指纹**，检查有效期和 TLS 握手签名；更换私钥需更新指纹。机构签发证书配置中继 `tls.cert_path` / `tls.key_path`，客户端删除 `tls.spki_sha256`，并确保有效 TLS 名称被证书覆盖；例如 `relay_addr = "203.0.113.10:443/netcrow"` 配合 `relay_sni = "relay.example.com"` 可连接 IP 并验证域名证书。私有 CA 可配置 `tls.ca_cert_path`，不能与指纹同时使用。相对证书路径以配置文件目录为准。
 
 仅支持 TCP：SOCKS5 CONNECT、HTTP CONNECT 和普通 HTTP 正向代理；不提供 TUN、UDP、ICMP 或 DHCP。代理无独立用户名/密码认证，示例仅监听回环地址；非回环监听需显式 `allow_remote_proxy = true` 并限制访问来源。客户端彼此互信，各自可以发布子网，应妥善保管独立 Token。
 

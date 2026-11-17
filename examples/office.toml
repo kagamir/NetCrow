@@ -1,7 +1,10 @@
 # 公司客户端：发布子网，不监听本地代理。
 id = "office"
 token = "REPLACE_WITH_RANDOM_OFFICE_TOKEN"
-relay_url = "wss://relay.example.com/netcrow"
+relay_addr = "relay.example.com:443/netcrow"
+# relay_sni 默认使用 relay_addr 中的域名或 IP；空字符串表示不发送 SNI。
+# relay_sni = "relay.example.com"
+# relay_sni = ""
 # shared_subnets 是本机对外共享范围，与代理分流用的 proxy_subnets 不同。
 shared_subnets = ["192.168.1.0/24"]
 

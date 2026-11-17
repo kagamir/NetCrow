@@ -226,20 +226,28 @@ def toml_string(value):
 def client_config(peer, relay_port, pin, *, socks=None, http=None, shares=False,
                   token=TOKEN, idle=0, control_port=None, open_timeout=12,
                   proxy_subnets=None, sleep_secs=4, control_mode="both",
-                  initially_disabled=False):
+                  initially_disabled=False, relay_host="localhost", relay_sni=None,
+                  ca_cert_path=None):
     lines = [
         f'id = "{peer}"', f'token = {toml_string(token)}',
-        f'relay_url = "wss://localhost:{relay_port}/netcrow"',
+        f'relay_addr = {toml_string(f"{relay_host}:{relay_port}/netcrow")}',
         f'shared_subnets = {["127.0.0.1/32"] if shares else []!r}'.replace("'", '"'),
     ]
+    if relay_sni is not None:
+        lines.append(f"relay_sni = {toml_string(relay_sni)}")
     if proxy_subnets is not None:
         lines.append(f"proxy_subnets = {proxy_subnets!r}".replace("'", '"'))
     if socks:
         lines.append(f'socks5_listen = "127.0.0.1:{socks}"')
     if http:
         lines.append(f'http_listen = "127.0.0.1:{http}"')
+    lines += ["[tls]"]
+    if ca_cert_path is None:
+        lines.append(f"spki_sha256 = {toml_string(pin)}")
+    else:
+        lines.append(f"ca_cert_path = {toml_string(ca_cert_path)}")
     lines += [
-        "[tls]", f'spki_sha256 = "{pin}"', "[connection]",
+        "[connection]",
         f"idle_secs = {idle}", f"sleep_secs = {sleep_secs}", "probe_secs = 1",
         "heartbeat_secs = 1", "heartbeat_timeout_secs = 4", "reconnect_secs = 1",
         f"open_timeout_secs = {open_timeout}", "connect_timeout_secs = 2", "max_streams = 128",
@@ -308,7 +316,8 @@ def run(binary):
             peers = "\n".join(
                 f'[[peers]]\nid = "{peer}"\ntoken = {toml_string(TOKEN)}'
                 for peer in ("office", "home", "pinbad", "authbad", "ca", "selected", "sleepy",
-                             "disableonly", "enableonly")
+                             "disableonly", "enableonly", "pinsilent", "pincustom",
+                             "casilent", "caname", "namebad")
             )
             relay = harness.write("relay", f'''
 listen = "127.0.0.1:{relay_port}"
@@ -318,7 +327,7 @@ max_streams_per_peer = 128
 [tls]
 cert_path = "relay-cert.pem"
 key_path = "relay-key.pem"
-names = ["localhost", "127.0.0.1"]
+names = ["localhost"]
 {peers}
 ''')
             relay_process = harness.start("relay", "relay", relay)
@@ -486,31 +495,49 @@ names = ["localhost", "127.0.0.1"]
 
             check_single_control_lists(harness, relay_port, pin, target_port)
 
-            ca_proxy_port = free_port()
-            ca_config = client_config("ca", relay_port, pin, socks=ca_proxy_port,
-                                      proxy_subnets=["127.0.0.1/32"])
-            ca_config = ca_config.replace(f'spki_sha256 = "{pin}"', 'ca_cert_path = "relay-cert.pem"')
-            ca_process = harness.start("ca", "client", harness.write("ca", ca_config))
-            wait_until(lambda: get_via_socks(ca_proxy_port, target_port), "custom CA verified connection")
-            ca_process.terminate()
-            ca_process.wait(timeout=5)
-            print("PASS custom CA trust with hostname validation")
+            # These use the real NetCrow WSS listener, not only a TLS handshake:
+            # no SNI and a custom SNI must still reach the /netcrow endpoint.
+            # The certificate has only a localhost SAN, so the IP dial with a
+            # localhost override also proves CA verification uses the TLS name.
+            for peer, connection, description in (
+                ("ca", {"ca_cert_path": "relay-cert.pem"}, "default TLS name with custom CA"),
+                ("pinsilent", {"relay_sni": ""}, "pinned WSS without SNI"),
+                ("pincustom", {"relay_host": "127.0.0.1", "relay_sni": "unlisted.example"},
+                 "pinned WSS with custom SNI independent of address/certificate names"),
+                ("casilent", {"relay_sni": "", "ca_cert_path": "relay-cert.pem"},
+                 "CA verification still checks address hostname without SNI"),
+                ("caname", {"relay_host": "127.0.0.1", "relay_sni": "localhost",
+                            "ca_cert_path": "relay-cert.pem"},
+                 "IP dial with CA verification against overridden TLS name"),
+            ):
+                tls_proxy_port = free_port()
+                tls_config = client_config(peer, relay_port, pin, socks=tls_proxy_port,
+                                           proxy_subnets=["127.0.0.1/32"], **connection)
+                tls_process = harness.start(peer, "client", harness.write(peer, tls_config))
+                try:
+                    wait_until(lambda: get_via_socks(tls_proxy_port, target_port), description)
+                    print(f"PASS {description}")
+                finally:
+                    tls_process.terminate()
+                    tls_process.wait(timeout=5)
 
-            for peer, candidate_pin, token in (
-                ("pinbad", "sha256/AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=", TOKEN),
-                ("authbad", pin, "wrong-test-token-000000000000000000000"),
+            for peer, candidate_pin, token, connection in (
+                ("pinbad", "sha256/AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=", TOKEN, {}),
+                ("authbad", pin, "wrong-test-token-000000000000000000000", {}),
+                ("namebad", pin, TOKEN, {"relay_host": "127.0.0.1", "relay_sni": "wrong.example",
+                                        "ca_cert_path": "relay-cert.pem"}),
             ):
                 rejected_port = free_port()
                 config = harness.write(peer, client_config(peer, relay_port, candidate_pin,
                                                            socks=rejected_port, token=token, open_timeout=3,
-                                                           proxy_subnets=["127.0.0.1/32"]))
+                                                           proxy_subnets=["127.0.0.1/32"], **connection))
                 process = harness.start(peer, "client", config)
                 # Listener availability is independent of TLS/auth success.
                 wait_until(lambda: listener_open(rejected_port), f"{peer} proxy listener")
                 assert_rejected(lambda: socks_connect(rejected_port, "127.0.0.1", target_port, timeout=6))
                 process.terminate()
                 process.wait(timeout=5)
-            print("PASS incorrect SPKI pin + incorrect peer token cannot forward")
+            print("PASS incorrect SPKI pin, peer token, or CA TLS name cannot forward")
             # An explicit empty list works before any successful relay handshake.
             unavailable_port = free_port()
             direct_port = free_port()

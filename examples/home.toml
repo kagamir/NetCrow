@@ -1,7 +1,10 @@
 # 家庭客户端：提供本机代理，不发布家庭网络。
 id = "home"
 token = "REPLACE_WITH_RANDOM_HOME_TOKEN"
-relay_url = "wss://relay.example.com/netcrow"
+relay_addr = "relay.example.com:443/netcrow"
+# relay_sni 默认使用 relay_addr 中的域名或 IP；空字符串表示不发送 SNI。
+# relay_sni = "relay.example.com"
+# relay_sni = ""
 shared_subnets = []
 # 省略 proxy_subnets：远端共享子网经中继，其余目的地址本机直连。
 # 显式列表：仅列表内地址经中继，其余直连；空列表 [] 表示全部直连。
@@ -12,7 +15,7 @@ allow_remote_proxy = false
 
 [tls]
 # 必须替换为中继 fingerprint 命令的实际输出。
-# 使用机构签发证书时删除此行，改为通过证书覆盖的域名连接。
+# 使用机构签发证书时删除此行，relay_sni 或连接目标须匹配证书名称。
 spki_sha256 = "sha256/AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
 
 [connection]

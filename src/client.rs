@@ -1,7 +1,7 @@
 //! Client connection lifecycle and multiplexed TCP streams.
 use crate::{
     auth,
-    config::ClientConfig,
+    config::{ClientConfig, RelayEndpoint},
     protocol::{self, Frame, Route, CHUNK_SIZE, INITIAL_CREDITS, QUEUE_SIZE, VERSION},
 };
 use anyhow::{anyhow, bail, ensure, Context, Result};
@@ -24,10 +24,11 @@ use tokio::{
     task::JoinSet,
     time::{self, Instant},
 };
-use tokio_tungstenite::{tungstenite::Message, Connector, MaybeTlsStream, WebSocketStream};
+use tokio_rustls::{client::TlsStream, TlsConnector};
+use tokio_tungstenite::{tungstenite::Message, WebSocketStream};
 use tokio_util::sync::CancellationToken;
 
-type Socket = WebSocketStream<MaybeTlsStream<TcpStream>>;
+type Socket = WebSocketStream<TlsStream<TcpStream>>;
 type OpenReply = oneshot::Sender<Result<DuplexStream>>;
 
 struct OpenRequest {
@@ -162,7 +163,8 @@ async fn connect_direct(
 
 pub async fn run(config: ClientConfig) -> Result<()> {
     config.validate()?;
-    let tls = crate::tls::client_config(&config.tls)?;
+    let endpoint = config.relay_endpoint()?;
+    let tls = crate::tls::client_config_for_relay(&config.tls, endpoint.enable_sni)?;
     let disabled = crate::control::spawn(config.control.clone());
     let (requests, receiver) = mpsc::channel(QUEUE_SIZE);
     let (routes, route_snapshot) = watch::channel(None);
@@ -176,7 +178,7 @@ pub async fn run(config: ClientConfig) -> Result<()> {
         connect_timeout: Duration::from_secs(config.connection.connect_timeout_secs),
     };
     let proxy = crate::proxy::serve(config.socks5_listen, config.http_listen, handle);
-    let manager = manage(config, tls, receiver, disabled, routes);
+    let manager = manage(config, endpoint, tls, receiver, disabled, routes);
     tokio::select! {
         result = proxy => result.context("proxy listeners stopped"),
         result = manager => result,
@@ -196,6 +198,7 @@ async fn wait_disabled(disabled: &mut watch::Receiver<bool>) {
 
 async fn manage(
     config: ClientConfig,
+    endpoint: RelayEndpoint,
     tls: Arc<rustls::ClientConfig>,
     mut requests: mpsc::Receiver<OpenRequest>,
     mut disabled: watch::Receiver<bool>,
@@ -260,7 +263,7 @@ async fn manage(
             _ = wait_disabled(&mut disabled) => continue,
             result = time::timeout(
                 Duration::from_secs(config.connection.connect_timeout_secs),
-                connect(&config, &wire_token, tls.clone()),
+                connect(&config, &endpoint, &wire_token, tls.clone()),
             ) => result.context("WSS connection timed out").and_then(|r| r),
         };
         let outcome = match connection {
@@ -311,17 +314,26 @@ async fn manage(
 
 async fn connect(
     config: &ClientConfig,
+    endpoint: &RelayEndpoint,
     wire_token: &str,
     tls: Arc<rustls::ClientConfig>,
 ) -> Result<(Socket, Vec<Route>)> {
-    let (mut socket, _) = tokio_tungstenite::connect_async_tls_with_config(
-        config.relay_url.as_str(),
+    // The transport address and HTTP Host come only from relay_addr. The TLS
+    // server name can differ, or SNI can be suppressed without disabling trust.
+    let stream = TcpStream::connect((endpoint.host.as_str(), endpoint.port))
+        .await
+        .context("connect relay TCP")?;
+    let stream = TlsConnector::from(tls)
+        .connect(endpoint.server_name.clone(), stream)
+        .await
+        .context("connect relay TLS")?;
+    let (mut socket, _) = tokio_tungstenite::client_async_with_config(
+        endpoint.websocket_uri.as_str(),
+        stream,
         Some(protocol::websocket_config()),
-        false,
-        Some(Connector::Rustls(tls)),
     )
     .await
-    .context("connect WSS")?;
+    .context("upgrade relay WebSocket")?;
     socket
         .send(protocol::encode(&Frame::Hello {
             version: VERSION,
@@ -781,6 +793,115 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    // Tungstenite fixes the handshake callback's error type to an HTTP response.
+    #[allow(clippy::result_large_err)]
+    async fn relay_transport_and_websocket_authority_are_independent_of_sni() {
+        time::timeout(Duration::from_secs(10), async {
+            for (host, sni, expected_sni) in [
+                (
+                    "127.0.0.1",
+                    Some("virtual.example"),
+                    Some("virtual.example"),
+                ),
+                ("localhost", None, Some("localhost")),
+                ("localhost", Some(""), None),
+                ("127.0.0.1", None, None),
+            ] {
+                let directory = tempfile::tempdir().unwrap();
+                let identity = crate::config::ServerTls {
+                    cert_path: directory.path().join("cert.pem"),
+                    key_path: directory.path().join("key.pem"),
+                    names: vec!["virtual.example".into(), "localhost".into()],
+                };
+                let server_tls = crate::tls::server_config(&identity).unwrap();
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let address = listener.local_addr().unwrap();
+                let path = "/edge/netcrow%2Ftest";
+                let sni_config = sni
+                    .map(|name| format!("relay_sni='{name}'\n"))
+                    .unwrap_or_default();
+                let mut config: ClientConfig = toml::from_str(&format!(
+                    "id='test-peer'\ntoken='raw token'\nrelay_addr='{host}:{}{path}'\n{sni_config}",
+                    address.port()
+                ))
+                .unwrap();
+                config.tls.spki_sha256 =
+                    Some(crate::tls::certificate_pin(&identity.cert_path).unwrap());
+                config.validate().unwrap();
+                let endpoint = config.relay_endpoint().unwrap();
+                let tls =
+                    crate::tls::client_config_for_relay(&config.tls, endpoint.enable_sni).unwrap();
+                let (request_tx, request_rx) = oneshot::channel();
+                let routes = vec![Route {
+                    peer: "other-peer".into(),
+                    subnet: "10.1.0.0/16".parse().unwrap(),
+                    online: true,
+                }];
+                let expected_routes = routes.clone();
+                let server = tokio::spawn(async move {
+                    use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
+                    let (stream, _) = listener.accept().await.unwrap();
+                    let stream = tokio_rustls::TlsAcceptor::from(server_tls)
+                        .accept(stream)
+                        .await
+                        .unwrap();
+                    let observed_sni = stream.get_ref().1.server_name().map(str::to_owned);
+                    let mut websocket = tokio_tungstenite::accept_hdr_async_with_config(
+                        stream,
+                        move |request: &Request, response: Response| {
+                            request_tx
+                                .send((
+                                    request.headers()["host"].to_str().unwrap().to_owned(),
+                                    request.uri().path().to_owned(),
+                                ))
+                                .unwrap();
+                            Ok(response)
+                        },
+                        Some(protocol::websocket_config()),
+                    )
+                    .await
+                    .unwrap();
+                    let Message::Binary(bytes) = websocket.next().await.unwrap().unwrap() else {
+                        panic!("expected binary authentication frame");
+                    };
+                    let Frame::Hello {
+                        version,
+                        id,
+                        token,
+                        subnets,
+                    } = protocol::decode(&bytes).unwrap()
+                    else {
+                        panic!("expected authentication hello");
+                    };
+                    assert_eq!(version, VERSION);
+                    assert_eq!(id, "test-peer");
+                    assert_eq!(token, auth::token_digest("raw token"));
+                    assert!(subnets.is_empty());
+                    websocket
+                        .send(protocol::encode(&Frame::Welcome { routes }).unwrap())
+                        .await
+                        .unwrap();
+                    observed_sni
+                });
+                let (socket, received_routes) =
+                    connect(&config, &endpoint, &auth::token_digest(&config.token), tls)
+                        .await
+                        .unwrap();
+                assert_eq!(socket.get_ref().get_ref().0.peer_addr().unwrap(), address);
+                assert_eq!(received_routes, expected_routes);
+                assert_eq!(
+                    request_rx.await.unwrap(),
+                    (format!("{host}:{}", address.port()), path.into())
+                );
+                assert_eq!(server.await.unwrap().as_deref(), expected_sni);
+            }
+        })
+        .await
+        .unwrap();
+    }
+
     #[test]
     fn routing_never_falls_back_to_internet_or_own_subnet() {
         let routes = vec![

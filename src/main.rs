@@ -70,7 +70,8 @@ async fn main() -> Result<()> {
             match mode {
                 Mode::Client => {
                     let c = config::load_client(&path)?;
-                    tls::client_config(&c.tls)?;
+                    let endpoint = c.relay_endpoint()?;
+                    tls::client_config_for_relay(&c.tls, endpoint.enable_sni)?;
                 }
                 Mode::Relay => {
                     config::load_relay(&path)?;
