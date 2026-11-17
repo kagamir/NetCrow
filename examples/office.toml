@@ -21,6 +21,8 @@ connect_timeout_secs = 10
 max_streams = 256
 
 # 按需取消注释并替换成你控制的公开 HTTPS 页面。
+# 仅 disable：命中停用，全部未命中恢复；仅 enable：命中恢复，全部未命中停用。
+# 两组都配置：停用优先，两组都未命中保持现状；请求失败不算未命中。
 # [control]
 # initially_disabled = false
 # interval_secs = 60

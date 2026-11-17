@@ -28,14 +28,16 @@ PAYLOAD = bytes(range(256)) * 512
 TOKEN = '密钥"\\\n\t\x00\x7f🔑'
 STOP_KEYWORD = "STOP[网].*"
 CONTROL = {"body": b"RUN", "status": 200}
+CONTROL_PAGES = {"/control": CONTROL}
 
 
 class TargetHandler(http.server.BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
     def do_GET(self):
-        body = CONTROL["body"] if self.path == "/control" else PAYLOAD * (64 if self.path == "/slow" else 32 if self.path == "/large" else 1)
-        status = CONTROL["status"] if self.path == "/control" else 200
+        control = CONTROL_PAGES.get(self.path)
+        body = control["body"] if control is not None else PAYLOAD * (64 if self.path == "/slow" else 32 if self.path == "/large" else 1)
+        status = control["status"] if control is not None else 200
         self.send_response(status)
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Connection", "close")
@@ -223,7 +225,8 @@ def toml_string(value):
 
 def client_config(peer, relay_port, pin, *, socks=None, http=None, shares=False,
                   token=TOKEN, idle=0, control_port=None, open_timeout=12,
-                  proxy_subnets=None, sleep_secs=4):
+                  proxy_subnets=None, sleep_secs=4, control_mode="both",
+                  initially_disabled=False):
     lines = [
         f'id = "{peer}"', f'token = {toml_string(token)}',
         f'relay_url = "wss://localhost:{relay_port}/netcrow"',
@@ -242,13 +245,52 @@ def client_config(peer, relay_port, pin, *, socks=None, http=None, shares=False,
         f"open_timeout_secs = {open_timeout}", "connect_timeout_secs = 2", "max_streams = 128",
     ]
     if control_port:
+        if control_mode not in ("both", "disable", "enable"):
+            raise ValueError(f"unknown control mode: {control_mode}")
+        control_path = "/control" if control_mode == "both" else f"/control-{control_mode}"
+        control_url = f'url = "http://127.0.0.1:{control_port}{control_path}"'
         lines += [
             "[control]", "interval_secs = 1", "timeout_secs = 2", "max_body_bytes = 1024",
-            "[[control.disable]]", f'url = "http://127.0.0.1:{control_port}/control"',
-            f'keyword = {toml_string(STOP_KEYWORD)}', "[[control.enable]]",
-            f'url = "http://127.0.0.1:{control_port}/control"', 'regex = "RUN"',
+            f"initially_disabled = {str(initially_disabled).lower()}",
         ]
+        if control_mode in ("both", "disable"):
+            lines += ["[[control.disable]]", control_url, f'keyword = {toml_string(STOP_KEYWORD)}']
+        if control_mode in ("both", "enable"):
+            lines += ["[[control.enable]]", control_url, 'regex = "RUN"']
     return "\n".join(lines) + "\n"
+
+
+def check_single_control_lists(harness, relay_port, pin, target_port):
+    # Dedicated pages prevent these transitions from changing the existing
+    # office/home pair, which continues exercising the two-list behavior.
+    for mode in ("disable", "enable"):
+        peer = f"{mode}only"
+        page = {"body": b"RUN", "status": 200}
+        CONTROL_PAGES[f"/control-{mode}"] = page
+        proxy_port = free_port()
+        config = harness.write(peer, client_config(
+            peer, relay_port, pin, socks=proxy_port, control_port=target_port,
+            control_mode=mode, initially_disabled=True,
+            proxy_subnets=["127.0.0.1/32"],
+        ))
+        process = harness.start(peer, "client", config)
+        try:
+            # A successful disable nonmatch / enable match must release the
+            # explicit startup-disabled state and permit an actual relay request.
+            harness.wait_log(peer, "WSS connected")
+            assert get_via_socks(proxy_port, target_port)
+            offset = len(harness.log(peer))
+            page["body"] = STOP_KEYWORD.encode("utf-8") if mode == "disable" else b"NO MATCH"
+            harness.wait_log(peer, "remote control disabled client", after=offset)
+            assert_rejected(lambda: socks_connect(proxy_port, "127.0.0.1", target_port, timeout=4))
+            offset = len(harness.log(peer))
+            page["body"] = b"NO MATCH" if mode == "disable" else b"RUN"
+            harness.wait_log(peer, "WSS connected", after=offset)
+            assert get_via_socks(proxy_port, target_port)
+            print(f"PASS {mode}-only polling releases startup state, stops, and reconnects")
+        finally:
+            process.terminate()
+            process.wait(timeout=5)
 
 
 def run(binary):
@@ -265,7 +307,8 @@ def run(binary):
         try:
             peers = "\n".join(
                 f'[[peers]]\nid = "{peer}"\ntoken = {toml_string(TOKEN)}'
-                for peer in ("office", "home", "pinbad", "authbad", "ca", "selected", "sleepy")
+                for peer in ("office", "home", "pinbad", "authbad", "ca", "selected", "sleepy",
+                             "disableonly", "enableonly")
             )
             relay = harness.write("relay", f'''
 listen = "127.0.0.1:{relay_port}"
@@ -421,6 +464,15 @@ names = ["localhost", "127.0.0.1"]
             assert_rejected(lambda: socks_connect(selected_port, "127.0.0.2", outside.server_port, timeout=4))
             print("PASS literal keyword disables with priority over regex enable; direct streams continue")
 
+            CONTROL["body"] = b"NO MATCH"
+            # With both lists present, a successful nonmatch preserves the
+            # disabled state instead of treating the missing match as revival.
+            stop = time.monotonic() + 1.5
+            while time.monotonic() < stop:
+                assert_rejected(lambda: socks_connect(socks_port, "127.0.0.1", target_port, timeout=4))
+                time.sleep(0.1)
+            print("PASS two-list successful nonmatch preserves disabled state")
+
             CONTROL["body"] = b"RUN"
             CONTROL["status"] = 500
             # A full control interval with HTTP errors must not revive a disabled client.
@@ -431,6 +483,8 @@ names = ["localhost", "127.0.0.1"]
             CONTROL["status"] = 200
             wait_until(lambda: get_via_socks(socks_port, target_port), "control revival", timeout=20)
             print("PASS control HTTP failure preserves disabled state + recovery reconnects")
+
+            check_single_control_lists(harness, relay_port, pin, target_port)
 
             ca_proxy_port = free_port()
             ca_config = client_config("ca", relay_port, pin, socks=ca_proxy_port,
@@ -513,7 +567,7 @@ names = ["localhost", "127.0.0.1"]
             assert get_via_socks(direct_port, target_port)
             print("PASS cached routes prevent fallback after relay loss; excluded addresses stay direct")
 
-            for name in ("relay", "home", "office", "selected", "sleepy", "direct"):
+            for name in ("relay", "home", "office", "selected", "sleepy", "direct", "disableonly", "enableonly"):
                 assert "panicked at" not in harness.log(name), f"panic in {name}"
             print("All NetCrow end-to-end checks passed.")
         except BaseException:

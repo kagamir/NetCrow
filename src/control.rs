@@ -45,7 +45,7 @@ impl Rule {
 }
 
 /// The receiver is immediately initialized, before any tunnel can connect.
-/// Fetch errors leave state unchanged; disable matches always take priority.
+/// Unknown checks cannot alone change state; disable matches take priority.
 pub fn spawn(config: Option<ControlConfig>) -> watch::Receiver<bool> {
     let (tx, rx) = watch::channel(config.as_ref().is_some_and(|c| c.initially_disabled));
     tokio::spawn(async move {
@@ -111,23 +111,34 @@ async fn evaluate(
             Ok(false) => {}
             Err(error) => {
                 disable_failed = true;
-                tracing::warn!(%error, "disable condition fetch failed; preserving state");
+                tracing::warn!(%error, "disable condition fetch failed; result is unknown");
             }
         }
     }
     if disable_failed {
         return None;
     }
+    let mut enable_failed = false;
     for rule in enable {
         match matches(client, rule, limit).await {
             Ok(true) => return Some(false),
             Ok(false) => {}
             Err(error) => {
-                tracing::warn!(%error, "enable condition fetch failed; preserving state")
+                enable_failed = true;
+                tracing::warn!(%error, "enable condition fetch failed; result is unknown");
             }
         }
     }
-    None
+    if enable_failed {
+        return None;
+    }
+    // With only one rule group, a successful complete nonmatch is the inverse
+    // of a match. With both groups (or neither), no match retains prior state.
+    match (disable.is_empty(), enable.is_empty()) {
+        (false, true) => Some(false),
+        (true, false) => Some(true),
+        _ => None,
+    }
 }
 
 async fn matches(client: &reqwest::Client, rule: &Rule, limit: usize) -> Result<bool> {
@@ -373,6 +384,118 @@ mod tests {
         let enable = [server.rule("/none", "ENABLE")];
         assert_eq!(evaluate(&client, &disable, &enable, 1024).await, None);
         assert_eq!(server.take_requests(), ["/none", "/none"]);
+
+        let enable = [
+            server.rule("/error", "ENABLE"),
+            server.rule("/enable", "ENABLE"),
+        ];
+        assert_eq!(
+            evaluate(&client, &disable, &enable, 1024).await,
+            Some(false)
+        );
+        assert_eq!(server.take_requests(), ["/none", "/error", "/enable"]);
+    }
+
+    #[tokio::test]
+    async fn disable_only_inverts_successful_nonmatches_but_not_unknown_results() {
+        let server = TestServer::start().await;
+        let client = http_client();
+        for (paths, expected) in [
+            (vec!["/both"], Some(true)),
+            (vec!["/none"], Some(false)),
+            (vec!["/none", "/both"], Some(true)),
+            (vec!["/none", "/none"], Some(false)),
+            (vec!["/error"], None),
+            (vec!["/none", "/error"], None),
+            (vec!["/error", "/none"], None),
+            (vec!["/error", "/both"], Some(true)),
+            (vec!["/invalid-utf8"], None),
+        ] {
+            let rules: Vec<_> = paths
+                .iter()
+                .map(|path| server.rule(path, "DISABLE"))
+                .collect();
+            assert_eq!(
+                evaluate(&client, &rules, &[], 1024).await,
+                expected,
+                "{paths:?}"
+            );
+            assert_eq!(server.take_requests(), paths);
+        }
+    }
+
+    #[tokio::test]
+    async fn enable_only_inverts_successful_nonmatches_but_not_unknown_results() {
+        let server = TestServer::start().await;
+        let client = http_client();
+        for (paths, expected) in [
+            (vec!["/enable"], Some(false)),
+            (vec!["/none"], Some(true)),
+            (vec!["/none", "/enable"], Some(false)),
+            (vec!["/none", "/none"], Some(true)),
+            (vec!["/error"], None),
+            (vec!["/none", "/error"], None),
+            (vec!["/error", "/none"], None),
+            (vec!["/error", "/enable"], Some(false)),
+            (vec!["/invalid-utf8"], None),
+        ] {
+            let rules: Vec<_> = paths
+                .iter()
+                .map(|path| server.rule(path, "ENABLE"))
+                .collect();
+            assert_eq!(
+                evaluate(&client, &[], &rules, 1024).await,
+                expected,
+                "{paths:?}"
+            );
+            assert_eq!(server.take_requests(), paths);
+        }
+    }
+
+    #[tokio::test]
+    async fn no_decision_preserves_both_possible_current_states() {
+        assert_eq!(evaluate(&http_client(), &[], &[], 1024).await, None);
+        for initially_disabled in [false, true] {
+            for (disable_paths, enable_paths) in [
+                (vec!["/none"], vec!["/none"]),
+                (vec!["/error"], vec![]),
+                (vec![], vec!["/error"]),
+                (vec![], vec![]),
+            ] {
+                let server = TestServer::start().await;
+                let request_count = disable_paths.len() + enable_paths.len();
+                let rule = |path: &&str| PageRule {
+                    url: format!("{}{path}", server.url),
+                    regex: None,
+                    keyword: Some("unmatched keyword".into()),
+                };
+                let config = ControlConfig {
+                    initially_disabled,
+                    interval_secs: 60,
+                    timeout_secs: 2,
+                    max_body_bytes: 1024,
+                    disable: disable_paths.iter().map(rule).collect(),
+                    enable: enable_paths.iter().map(rule).collect(),
+                };
+                let mut state = spawn(Some(config));
+                // The startup value remains immediate even when the first
+                // asynchronous poll will make no decision.
+                assert_eq!(*state.borrow(), initially_disabled);
+                tokio::time::timeout(Duration::from_secs(2), async {
+                    while server.requests.lock().unwrap().len() < request_count {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .unwrap();
+                assert!(
+                    tokio::time::timeout(Duration::from_millis(20), state.changed())
+                        .await
+                        .is_err()
+                );
+                assert_eq!(*state.borrow(), initially_disabled);
+            }
+        }
     }
 
     #[tokio::test]
