@@ -162,26 +162,3 @@ cargo fmt --all -- --check
 python3 -m unittest discover -s tests -p 'test_release_*.py'
 python3 tests/e2e.py target/release/netcrow
 ```
-
-## 自动发布
-
-推送任意 Git tag 后，CI 自动构建以下六种二进制包；所有检查和构建成功后才创建并发布对应的 GitHub Release。
-
-| 系统 | 架构 / Rust target | 包格式 |
-| --- | --- | --- |
-| Linux | x86_64：`x86_64-unknown-linux-musl`；ARM64：`aarch64-unknown-linux-musl` | `.tar.gz`，musl 静态链接 |
-| Windows | x86_64：`x86_64-pc-windows-msvc`；ARM64：`aarch64-pc-windows-msvc` | `.zip` |
-| macOS | Intel：`x86_64-apple-darwin`；Apple Silicon：`aarch64-apple-darwin` | `.tar.gz` |
-
-例如，提交待发布代码后执行：
-
-```bash
-git tag v0.1.0
-git push origin v0.1.0
-```
-
-压缩包名为 `netcrow-<tag>-<target>`，内含可执行文件、README、许可证和三份配置示例；包含特殊字符的 tag 会转换为安全文件名并附加短哈希。Release 同时提供 `SHA256SUMS`，下载全部压缩包后可用 `sha256sum -c SHA256SUMS` 校验（macOS 使用 `shasum -a 256 -c SHA256SUMS`）。
-
-普通分支提交、PR 和手动运行只生成 Actions 构建产物，不发布 Release。发布作业使用仓库自带的 `GITHUB_TOKEN`，无需配置额外密钥；失败的发布可重跑，已发布的完整产物不会被覆盖。程序 `--version` 来自 `Cargo.toml`，发布前如需升级版本应同步修改并更新 `Cargo.lock`。
-
-日志可通过 `RUST_LOG=netcrow=debug` 调整。许可证：[MIT](LICENSE)。
