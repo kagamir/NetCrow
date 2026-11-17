@@ -4,7 +4,7 @@ Rust 编写的异地子网共享工具，一个无图形界面的可执行文件
 
 ## 快速开始
 
-安装 Rust stable 后编译，Linux / macOS 产物为 `target/release/netcrow`，Windows 为 `target/release/netcrow.exe`：
+可从 [GitHub Releases](https://github.com/kagamir/NetCrow/releases) 下载对应平台的压缩包，解压后使用其中的可执行文件和 `examples/` 配置。也可以安装 Rust stable 后编译，Linux / macOS 产物为 `target/release/netcrow`，Windows 为 `target/release/netcrow.exe`：
 
 ```bash
 git clone https://github.com/kagamir/NetCrow.git
@@ -52,46 +52,96 @@ curl --proxy http://127.0.0.1:8080 http://192.168.1.20/
 
 域名在本机解析后按 IP 分流；公司专有域名需配置可用 DNS 或改用内网 IP。远端路由按最长前缀匹配，相同 CIDR 不能被不同客户端重复发布。家庭和公司网段重叠时，应显式配置分流范围。
 
-## 连接与休眠
+## 完整配置参考
 
-客户端配置示例，时间单位为秒：
+以下覆盖全部配置项。注释中的“默认”表示省略该项时的值；“必填”没有默认值。所有时间单位为秒，相对证书路径以配置文件目录为准。示例 ID、Token、地址和指纹必须按部署修改；被注释的可选项不会启用。
+
+### 中继 `relay.toml`
 
 ```toml
-[connection]
-idle_secs = 600              # 10 分钟无隧道业务活动后断开；0 表示一直保活
-sleep_secs = 60              # 休眠后每隔约 1 分钟上线检查
-probe_secs = 2               # 检查窗口，无待办业务则再次断开
-heartbeat_secs = 20
-heartbeat_timeout_secs = 60
-reconnect_secs = 3
-open_timeout_secs = 90
-connect_timeout_secs = 10
-max_streams = 256
+listen = "0.0.0.0:443"        # 必填：监听 IP:端口；443 只是示例，不是默认值
+websocket_path = "/netcrow"  # 默认：WSS 路径，须以 / 开头且不含 ?
+pending_timeout_secs = 90    # 默认：等待远端建立连接的最长时间
+max_streams_per_peer = 256   # 默认：每个客户端并发流上限，范围 1～4096
+peer_timeout_secs = 60       # 默认：客户端多久无消息后判定断线
+
+[tls]                       # 整表可省略，使用以下默认值
+cert_path = "netcrow-cert.pem" # 默认：PEM 证书链文件
+key_path = "netcrow-key.pem"   # 默认：PEM 私钥文件
+names = ["localhost"]         # 默认：自动生成自签证书时的名称
+
+# peers 必填，无默认值：配置 1～256 个客户端，每个 ID 唯一。
+[[peers]]
+id = "office"               # 必填：1～64 个 ASCII 字母、数字、_ 或 -
+token = "REPLACE_WITH_RANDOM_OFFICE_TOKEN_AT_LEAST_32_BYTES" # 必填：32～256 字节
+
+[[peers]]
+id = "home"
+token = "REPLACE_WITH_RANDOM_HOME_TOKEN_AT_LEAST_32_BYTES"
 ```
 
-发起中继请求或传输业务字节算活动，心跳、路由更新、定期检查和直连流量不算。本机中继请求立即唤醒本机；远端休眠时，中继暂存新连接请求，等待其下次上线。中继 `pending_timeout_secs` 与发起方 `open_timeout_secs` 应大于远端 `sleep_secs` 并预留连接时间。
+### 客户端 `client.toml`
+
+```toml
+id = "home"                 # 必填：规则同中继 peers.id，且须与中继登记一致
+token = "REPLACE_WITH_RANDOM_HOME_TOKEN_AT_LEAST_32_BYTES" # 必填：须与中继登记一致
+relay_url = "wss://relay.example.com/netcrow" # 必填：wss URL，不含账号、密码或片段
+shared_subnets = []          # 默认：不共享子网；最多 64 个 IPv4 / IPv6 CIDR
+# shared_subnets = ["192.168.1.0/24"] # 替换上一行可共享此网段
+
+# proxy_subnets 默认省略：自动使用已学习的远端子网，不等同于 []。
+# proxy_subnets = ["192.168.1.0/24"] # 仅列表内目的地址经中继，其余本机直连
+# proxy_subnets = []               # 全部本机直连，与上一行二选一
+# socks5_listen = "127.0.0.1:1080"  # 默认省略：不启动 SOCKS5；此端口只是示例
+# http_listen = "127.0.0.1:8080"    # 默认省略：不启动 HTTP 代理；此端口只是示例
+allow_remote_proxy = false   # 默认：禁止代理监听非回环地址
+
+[tls]                       # 整表可省略：使用内置公共 CA，验证证书链和主机名
+# spki_sha256 默认省略；自签模式须填真实 SPKI SHA-256 指纹，以下仅为格式示例。
+# spki_sha256 = "sha256/AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+# ca_cert_path = "company-ca.pem" # 默认省略；添加私有 CA，仍检查主机名
+# spki_sha256 与 ca_cert_path 互斥；两者都省略时使用公共 CA 模式。
+
+[connection]                # 整表可省略，使用以下默认值
+idle_secs = 600              # 默认：10 分钟无隧道业务活动后休眠；0 表示一直保活
+sleep_secs = 60              # 默认：休眠后等待多久再上线检查
+probe_secs = 2               # 默认：检查窗口，无待办业务则再次断开
+heartbeat_secs = 20         # 默认：WSS 心跳间隔
+heartbeat_timeout_secs = 60 # 默认：多久未收到中继消息后断开，须大于心跳间隔
+reconnect_secs = 3           # 默认：非休眠断线重连间隔基准，附少量随机延迟
+open_timeout_secs = 90       # 默认：代理连接请求总等待时间
+connect_timeout_secs = 10    # 默认：WSS / 目标 TCP 建连及网络写入超时
+max_streams = 256            # 默认：客户端并发流上限，范围 1～4096
+
+[control]                   # 默认省略整表：不启用页面条件轮询
+initially_disabled = false  # 配置此表时的默认值：启动时允许隧道连接
+interval_secs = 60           # 默认：条件轮询间隔
+timeout_secs = 10           # 默认：单次页面请求超时
+max_body_bytes = 1048576     # 默认：页面响应最多 1 MiB
+disable = []                # 默认：无停用规则；任一规则匹配即可停用
+enable = []                 # 默认：无恢复规则；任一规则匹配即可恢复
+
+# 配置规则时，先删除上面的 disable = [] / enable = []，再取消以下注释。
+# 可重复添加同名数组表来配置多条规则。每条规则的 url、regex 都必填，无默认值。
+# [[control.disable]]
+# url = "https://control.example.com/netcrow.txt" # 必填：HTTP(S) URL
+# regex = '(?m)^office=disabled$'                 # 必填：Rust regex 正则表达式
+# [[control.enable]]
+# url = "https://control.example.com/netcrow.txt" # 必填：HTTP(S) URL
+# regex = '(?m)^office=enabled$'                  # 必填：Rust regex 正则表达式
+```
+
+除 `idle_secs` 可为 `0`，其他时间参数、数量和响应大小限制必须为正数。条件 URL 不得包含账号、密码或片段。未知配置字段会报错，避免拼写错误被忽略。
+
+## 连接与休眠
+
+发起中继请求或传输业务字节算活动，心跳、路由更新、定期检查和直连流量不算。本机中继请求立即唤醒本机；远端休眠时，中继暂存新连接请求，等待其下次上线。默认 10 分钟无活动后休眠，每隔约 1 分钟上线检查。中继 `pending_timeout_secs` 与发起方 `open_timeout_secs` 应大于远端 `sleep_secs` 并预留连接时间。
 
 休眠、断线或停用会关闭已有隧道 TCP 会话，恢复后不续接或重放，应用需自行重试。中继在内存保留离线路由；中继重启后，共享方重新注册才能恢复路由。
 
 ## 远程停用与恢复
 
-在客户端配置中添加规则，轮询自己控制的 HTTPS 页面：
-
-```toml
-[control]
-initially_disabled = false
-interval_secs = 60
-
-[[control.disable]]
-url = "https://control.example.com/netcrow.txt"
-regex = '(?m)^office=disabled$'
-
-[[control.enable]]
-url = "https://control.example.com/netcrow.txt"
-regex = '(?m)^office=enabled$'
-```
-
-任一停用规则匹配即断开 WSS、关闭隧道会话并停止中继请求；恢复规则匹配后重新连接，停用规则优先。检查失败保持状态，停用页面检查失败时也不会执行恢复。仅控制隧道状态，不执行页面中的命令。
+按照完整配置中的 `control` 示例，轮询自己控制的 HTTPS 页面。任一停用规则匹配即断开 WSS、关闭隧道会话并停止中继请求；恢复规则匹配后重新连接，停用规则优先。检查失败保持状态，停用页面检查失败时也不会执行恢复。仅控制隧道状态，不执行页面中的命令。
 
 启动状态取自 `initially_disabled`，不跨重启保存。设为 `true` 可等待恢复规则授权后再连接。页面轮询在休眠和停用期间继续，直接访问页面，不走隧道或系统代理环境变量，因此仍产生流量。
 
@@ -109,7 +159,29 @@ WSS 加密内容，但中继 IP、时间、流量大小、SNI 和 TLS 特征仍�
 cargo test --locked
 cargo clippy --all-targets --locked -- -D warnings
 cargo fmt --all -- --check
+python3 -m unittest discover -s tests -p 'test_release_*.py'
 python3 tests/e2e.py target/release/netcrow
 ```
+
+## 自动发布
+
+推送任意 Git tag 后，CI 自动构建以下六种二进制包；所有检查和构建成功后才创建并发布对应的 GitHub Release。
+
+| 系统 | 架构 / Rust target | 包格式 |
+| --- | --- | --- |
+| Linux | x86_64：`x86_64-unknown-linux-musl`；ARM64：`aarch64-unknown-linux-musl` | `.tar.gz`，musl 静态链接 |
+| Windows | x86_64：`x86_64-pc-windows-msvc`；ARM64：`aarch64-pc-windows-msvc` | `.zip` |
+| macOS | Intel：`x86_64-apple-darwin`；Apple Silicon：`aarch64-apple-darwin` | `.tar.gz` |
+
+例如，提交待发布代码后执行：
+
+```bash
+git tag v0.1.0
+git push origin v0.1.0
+```
+
+压缩包名为 `netcrow-<tag>-<target>`，内含可执行文件、README、许可证和三份配置示例；包含特殊字符的 tag 会转换为安全文件名并附加短哈希。Release 同时提供 `SHA256SUMS`，下载全部压缩包后可用 `sha256sum -c SHA256SUMS` 校验（macOS 使用 `shasum -a 256 -c SHA256SUMS`）。
+
+普通分支提交、PR 和手动运行只生成 Actions 构建产物，不发布 Release。发布作业使用仓库自带的 `GITHUB_TOKEN`，无需配置额外密钥；失败的发布可重跑，已发布的完整产物不会被覆盖。程序 `--version` 来自 `Cargo.toml`，发布前如需升级版本应同步修改并更新 `Cargo.lock`。
 
 日志可通过 `RUST_LOG=netcrow=debug` 调整。许可证：[MIT](LICENSE)。
