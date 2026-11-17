@@ -1,0 +1,35 @@
+# 公司客户端：发布子网，不监听本地代理。
+id = "office"
+token = "REPLACE_WITH_RANDOM_OFFICE_TOKEN_AT_LEAST_32_BYTES"
+relay_url = "wss://relay.example.com/netcrow"
+shared_subnets = ["192.168.1.0/24"]
+
+[tls]
+# 必须替换为中继 fingerprint 命令的实际输出；此占位指纹不会信任实际中继。
+spki_sha256 = "sha256/AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+
+[connection]
+idle_secs = 600
+sleep_secs = 60
+probe_secs = 2
+heartbeat_secs = 20
+heartbeat_timeout_secs = 60
+reconnect_secs = 3
+open_timeout_secs = 90
+connect_timeout_secs = 10
+max_streams = 256
+
+# 按需取消注释并替换成你控制的公开 HTTPS 页面。
+# [control]
+# initially_disabled = false
+# interval_secs = 60
+# timeout_secs = 10
+# max_body_bytes = 1048576
+#
+# [[control.disable]]
+# url = "https://control.example.com/netcrow.txt"
+# regex = '(?m)^office=disabled$'
+#
+# [[control.enable]]
+# url = "https://control.example.com/netcrow.txt"
+# regex = '(?m)^office=enabled$'

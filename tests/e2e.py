@@ -1,0 +1,444 @@
+#!/usr/bin/env python3
+"""Exercise NetCrow's real TLS, relay, TCP proxy and lifecycle paths.
+
+Run after `cargo build`: python3 tests/e2e.py [path/to/netcrow].
+Uses only Python's standard library and loopback services; no public network.
+"""
+from __future__ import annotations
+
+import concurrent.futures
+import hashlib
+import http.server
+import os
+from pathlib import Path
+import re
+import socket
+import socketserver
+import struct
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+
+PAYLOAD = bytes(range(256)) * 512
+TOKEN = "netcrow-integration-test-secret-00000000"
+CONTROL = {"body": b"RUN", "status": 200}
+
+
+class TargetHandler(http.server.BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+
+    def do_GET(self):
+        body = CONTROL["body"] if self.path == "/control" else PAYLOAD * (64 if self.path == "/slow" else 32 if self.path == "/large" else 1)
+        status = CONTROL["status"] if self.path == "/control" else 200
+        self.send_response(status)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Connection", "close")
+        self.end_headers()
+        self.wfile.write(body)
+        self.close_connection = True
+
+    def do_POST(self):
+        body = self.rfile.read(int(self.headers.get("Content-Length", "0")))
+        self.send_response(200)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Connection", "close")
+        self.end_headers()
+        self.wfile.write(body)
+        self.close_connection = True
+
+    def log_message(self, *_):
+        pass
+
+
+class HalfCloseHandler(socketserver.BaseRequestHandler):
+    def handle(self):
+        self.request.settimeout(20)
+        digest = hashlib.sha256()
+        while data := self.request.recv(16384):
+            digest.update(data)
+        self.request.sendall(digest.hexdigest().encode("ascii"))
+
+
+class ThreadServer(socketserver.ThreadingTCPServer):
+    allow_reuse_address = True
+    daemon_threads = True
+
+
+def free_port():
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        return sock.getsockname()[1]
+
+
+def receive(sock, count):
+    result = bytearray()
+    while len(result) < count:
+        block = sock.recv(count - len(result))
+        if not block:
+            raise EOFError(f"expected {count} bytes, received {len(result)}")
+        result.extend(block)
+    return bytes(result)
+
+
+def receive_all(sock):
+    parts = []
+    while block := sock.recv(65536):
+        parts.append(block)
+    return b"".join(parts)
+
+
+def wait_until(fn, label, timeout=15):
+    deadline = time.monotonic() + timeout
+    last_error = None
+    while time.monotonic() < deadline:
+        try:
+            result = fn()
+            if result:
+                return result
+        except (OSError, EOFError, AssertionError) as error:
+            last_error = error
+        time.sleep(0.05)
+    raise AssertionError(f"timed out waiting for {label}; last error: {last_error}")
+
+
+def socks_connect(port, destination, destination_port, *, timeout=12):
+    sock = socket.create_connection(("127.0.0.1", port), timeout=timeout)
+    try:
+        sock.sendall(b"\x05\x01\x00")
+        assert receive(sock, 2) == b"\x05\x00", "SOCKS5 no-auth negotiation failed"
+        try:
+            packed = socket.inet_pton(socket.AF_INET, destination)
+            address = b"\x01" + packed
+        except OSError:
+            name = destination.encode("ascii")
+            address = b"\x03" + bytes([len(name)]) + name
+        sock.sendall(b"\x05\x01\x00" + address + struct.pack("!H", destination_port))
+        prefix = receive(sock, 4)
+        assert prefix[0] == 5 and prefix[2] == 0, f"invalid SOCKS response: {prefix!r}"
+        if prefix[3] == 1:
+            receive(sock, 6)
+        elif prefix[3] == 4:
+            receive(sock, 18)
+        elif prefix[3] == 3:
+            receive(sock, receive(sock, 1)[0] + 2)
+        else:
+            raise AssertionError(f"invalid SOCKS address type: {prefix!r}")
+        if prefix[1] != 0:
+            raise OSError(f"SOCKS connect rejected: {prefix[1]}")
+        return sock
+    except BaseException:
+        sock.close()
+        raise
+
+
+def verify_http(response, expected=PAYLOAD):
+    headers, separator, body = response.partition(b"\r\n\r\n")
+    assert separator, f"missing HTTP response headers: {response[:200]!r}"
+    assert headers.startswith(b"HTTP/1.1 200") or headers.startswith(b"HTTP/1.0 200"), headers
+    assert body == expected, f"response corruption: got {len(body)}, expected {len(expected)} bytes"
+    return True
+
+
+def get_via_socks(proxy_port, target_port, host="127.0.0.1"):
+    with socks_connect(proxy_port, host, target_port) as sock:
+        sock.sendall(b"GET /payload HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+        return verify_http(receive_all(sock))
+
+
+def assert_rejected(fn):
+    try:
+        connection = fn()
+    except (OSError, EOFError):
+        return True
+    if hasattr(connection, "close"):
+        connection.close()
+    raise AssertionError("connection unexpectedly succeeded")
+
+
+class Harness:
+    def __init__(self, binary, directory):
+        self.binary = binary
+        self.directory = Path(directory)
+        self.processes = []
+        self.logs = {}
+        self.handles = []
+
+    def write(self, name, text):
+        path = self.directory / f"{name}.toml"
+        path.write_text(text, encoding="utf-8")
+        return path
+
+    def start(self, name, mode, config):
+        logfile = self.directory / f"{name}.log"
+        handle = logfile.open("wb")
+        self.handles.append(handle)
+        process = subprocess.Popen(
+            [self.binary, mode, "--config", str(config)],
+            stdout=handle, stderr=subprocess.STDOUT,
+            env={**os.environ, "RUST_LOG": "netcrow=info"},
+        )
+        self.processes.append(process)
+        self.logs[name] = logfile
+        return process
+
+    def log(self, name):
+        return self.logs[name].read_text(encoding="utf-8", errors="replace")
+
+    def wait_log(self, name, phrase, *, after=0, timeout=15):
+        return wait_until(lambda: phrase in self.log(name)[after:], f"{name}: {phrase}", timeout)
+
+    def check_running(self):
+        for process in self.processes:
+            assert process.poll() is None, f"NetCrow process exited with {process.returncode}"
+
+    def close(self):
+        for process in reversed(self.processes):
+            if process.poll() is None:
+                process.terminate()
+        for process in self.processes:
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=5)
+        for handle in self.handles:
+            handle.close()
+
+    def diagnostics(self):
+        for name in self.logs:
+            print(f"\n--- {name} log ---\n{self.log(name)[-20000:]}", file=sys.stderr)
+
+
+def client_config(peer, relay_port, pin, *, socks=None, http=None, shares=False,
+                  token=TOKEN, idle=0, control_port=None, open_timeout=12):
+    lines = [
+        f'id = "{peer}"', f'token = "{token}"',
+        f'relay_url = "wss://localhost:{relay_port}/netcrow"',
+        f'shared_subnets = {["127.0.0.1/32"] if shares else []!r}'.replace("'", '"'),
+    ]
+    if socks:
+        lines.append(f'socks5_listen = "127.0.0.1:{socks}"')
+    if http:
+        lines.append(f'http_listen = "127.0.0.1:{http}"')
+    lines += [
+        "[tls]", f'spki_sha256 = "{pin}"', "[connection]",
+        f"idle_secs = {idle}", "sleep_secs = 4", "probe_secs = 1",
+        "heartbeat_secs = 1", "heartbeat_timeout_secs = 4", "reconnect_secs = 1",
+        f"open_timeout_secs = {open_timeout}", "connect_timeout_secs = 2", "max_streams = 128",
+    ]
+    if control_port:
+        lines += [
+            "[control]", "interval_secs = 1", "timeout_secs = 2", "max_body_bytes = 1024",
+            "[[control.disable]]", f'url = "http://127.0.0.1:{control_port}/control"',
+            'regex = "STOP"', "[[control.enable]]",
+            f'url = "http://127.0.0.1:{control_port}/control"', 'regex = "RUN"',
+        ]
+    return "\n".join(lines) + "\n"
+
+
+def run(binary):
+    with tempfile.TemporaryDirectory(prefix="netcrow-e2e-") as directory:
+        harness = Harness(binary, directory)
+        httpd = http.server.ThreadingHTTPServer(("127.0.0.1", 0), TargetHandler)
+        halfclose = ThreadServer(("127.0.0.1", 0), HalfCloseHandler)
+        outside = http.server.ThreadingHTTPServer(("127.0.0.2", 0), TargetHandler)
+        for server in (httpd, halfclose, outside):
+            threading.Thread(target=server.serve_forever, daemon=True).start()
+        target_port = httpd.server_port
+        halfclose_port = halfclose.server_address[1]
+        relay_port, socks_port, http_port = (free_port() for _ in range(3))
+        try:
+            peers = "\n".join(
+                f'[[peers]]\nid = "{peer}"\ntoken = "{TOKEN}"\nallowed_subnets = '
+                + ('["127.0.0.1/32"]' if peer == "office" else "[]")
+                for peer in ("office", "home", "pinbad", "authbad", "ca")
+            )
+            relay = harness.write("relay", f'''
+listen = "127.0.0.1:{relay_port}"
+pending_timeout_secs = 15
+peer_timeout_secs = 6
+max_streams_per_peer = 128
+[tls]
+cert_path = "relay-cert.pem"
+key_path = "relay-key.pem"
+names = ["localhost", "127.0.0.1"]
+{peers}
+''')
+            harness.start("relay", "relay", relay)
+            cert = harness.directory / "relay-cert.pem"
+            wait_until(lambda: cert.exists() and cert.stat().st_size > 100, "relay certificate")
+            output = subprocess.check_output(
+                [binary, "fingerprint", "--cert", str(cert)], text=True, timeout=10
+            )
+            match = re.search(r"sha256/[A-Za-z0-9+/]{43}=", output)
+            assert match, f"invalid fingerprint command output: {output!r}"
+            pin = match.group(0)
+            office = harness.write("office", client_config("office", relay_port, pin, shares=True, idle=2, control_port=target_port))
+            home = harness.write("home", client_config("home", relay_port, pin, socks=socks_port,
+                                                       http=http_port, control_port=target_port))
+            harness.start("office", "client", office)
+            harness.start("home", "client", home)
+            wait_until(lambda: get_via_socks(socks_port, target_port), "SOCKS routed request", timeout=20)
+            print("PASS SOCKS5 IPv4 + large payload")
+            assert get_via_socks(socks_port, target_port, host="localhost")
+            print("PASS SOCKS5 DNS name + route selection")
+
+            with socket.create_connection(("127.0.0.1", http_port), timeout=12) as sock:
+                # Send CONNECT and the next protocol's data together: neither can be lost.
+                sock.sendall(f"CONNECT 127.0.0.1:{target_port} HTTP/1.1\r\nHost: localhost\r\n\r\n".encode()
+                             + b"GET /payload HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+                result = receive_all(sock)
+                connect_headers, _, tunneled = result.partition(b"\r\n\r\n")
+                assert b" 200 " in connect_headers, connect_headers
+                verify_http(tunneled)
+            print("PASS HTTP CONNECT + coalesced tunnel bytes")
+
+            with socket.create_connection(("127.0.0.1", http_port), timeout=12) as sock:
+                sock.sendall(f"GET http://127.0.0.1:{target_port}/payload HTTP/1.1\r\nHost: 127.0.0.1:{target_port}\r\nProxy-Connection: keep-alive\r\n\r\n".encode())
+                verify_http(receive_all(sock))
+            post_body = b"request body after headers\x00" * 3000
+            with socket.create_connection(("127.0.0.1", http_port), timeout=12) as sock:
+                sock.sendall(f"POST http://127.0.0.1:{target_port}/echo HTTP/1.1\r\nHost: 127.0.0.1:{target_port}\r\nContent-Length: {len(post_body)}\r\n\r\n".encode() + post_body)
+                verify_http(receive_all(sock), post_body)
+            print("PASS absolute-form HTTP GET/POST + body preservation")
+
+            with socks_connect(socks_port, "127.0.0.1", halfclose_port) as sock:
+                sock.sendall(PAYLOAD * 64)
+                sock.shutdown(socket.SHUT_WR)
+                assert receive_all(sock) == hashlib.sha256(PAYLOAD * 64).hexdigest().encode()
+            print("PASS TCP half-close + 8 MiB binary upload across bounded queues")
+            with socks_connect(socks_port, "127.0.0.1", target_port) as sock:
+                sock.sendall(b"GET /large HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+                verify_http(receive_all(sock), PAYLOAD * 32)
+            print("PASS 4 MiB download across bounded queues")
+
+            with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+                assert all(pool.map(lambda _: get_via_socks(socks_port, target_port), range(8)))
+            print("PASS concurrent multiplexed streams")
+
+            # Fill one destination's receive window while another stream remains live.
+            # A connection-wide blocked send would stall the independent GET below.
+            slow_started = threading.Event()
+            drain_slow = threading.Event()
+
+            def slow_download():
+                with socks_connect(socks_port, "127.0.0.1", target_port) as sock:
+                    sock.sendall(b"GET /slow HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+                    header = bytearray()
+                    while not header.endswith(b"\r\n\r\n"):
+                        header.extend(receive(sock, 1))
+                        assert len(header) <= 8192, "oversized slow response headers"
+                    assert b" 200 " in header
+                    body = bytearray(receive(sock, 16384))
+                    slow_started.set()
+                    assert drain_slow.wait(timeout=8), "independent request stalled behind slow stream"
+                    while block := sock.recv(16384):
+                        body.extend(block)
+                        time.sleep(0.003)
+                    assert body == PAYLOAD * 64, "slow stream was truncated or corrupted"
+                    return True
+
+            with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+                slow_future = pool.submit(slow_download)
+                assert slow_started.wait(timeout=10), "slow stream never started"
+                time.sleep(0.3)  # Give the sender enough time to exhaust this stream's credit.
+                independent = pool.submit(get_via_socks, socks_port, target_port)
+                try:
+                    assert independent.result(timeout=5), "unrelated stream failed"
+                finally:
+                    drain_slow.set()
+                assert slow_future.result(timeout=20)
+            print("PASS slow 8 MiB reader preserves unrelated stream + all payload bytes")
+
+            with socket.create_connection(("127.0.0.2", outside.server_port), timeout=5) as sock:
+                sock.sendall(b"GET /payload HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+                verify_http(receive_all(sock))
+            assert_rejected(lambda: socks_connect(socks_port, "127.0.0.2", outside.server_port))
+            with socket.create_connection(("127.0.0.1", socks_port), timeout=5) as sock:
+                sock.sendall(b"\x05\x01\x00")
+                assert receive(sock, 2) == b"\x05\x00"
+                sock.sendall(b"\x05\x03\x00\x01\x7f\x00\x00\x01\x00\x35")
+                assert receive(sock, 2) == b"\x05\x07", "UDP ASSOCIATE must be unsupported"
+            print("PASS out-of-route rejection + SOCKS UDP rejection")
+
+            offset = len(harness.log("office"))
+            harness.wait_log("office", "entering sleep", after=offset)
+            assert get_via_socks(socks_port, target_port)
+            harness.wait_log("office", "checking pending requests", after=offset)
+            print("PASS control polls do not reset idle + offline queued request + scheduled wake")
+
+            active = socks_connect(socks_port, "127.0.0.1", halfclose_port)
+            active.sendall(b"unfinished request")
+            home_offset = len(harness.log("home"))
+            CONTROL["body"] = b"STOP RUN"  # Disable wins when both rules match.
+            harness.wait_log("home", "remote control disabled client", after=home_offset)
+            active.settimeout(5)
+            try:
+                assert active.recv(1) == b"", "disabled client left a TCP stream alive"
+            except ConnectionResetError:
+                pass
+            finally:
+                active.close()
+            assert_rejected(lambda: socks_connect(socks_port, "127.0.0.1", target_port, timeout=4))
+            print("PASS remote disable wins conflict + closes active streams + rejects new requests")
+
+            CONTROL["body"] = b"RUN"
+            CONTROL["status"] = 500
+            # A full control interval with HTTP errors must not revive a disabled client.
+            stop = time.monotonic() + 1.5
+            while time.monotonic() < stop:
+                assert_rejected(lambda: socks_connect(socks_port, "127.0.0.1", target_port, timeout=4))
+                time.sleep(0.1)
+            CONTROL["status"] = 200
+            wait_until(lambda: get_via_socks(socks_port, target_port), "control revival", timeout=20)
+            print("PASS control HTTP failure preserves disabled state + recovery reconnects")
+
+            ca_proxy_port = free_port()
+            ca_config = client_config("ca", relay_port, pin, socks=ca_proxy_port)
+            ca_config = ca_config.replace(f'spki_sha256 = "{pin}"', 'ca_cert_path = "relay-cert.pem"')
+            ca_process = harness.start("ca", "client", harness.write("ca", ca_config))
+            wait_until(lambda: get_via_socks(ca_proxy_port, target_port), "custom CA verified connection")
+            ca_process.terminate()
+            ca_process.wait(timeout=5)
+            print("PASS custom CA trust with hostname validation")
+
+            for peer, candidate_pin, token in (
+                ("pinbad", "sha256/AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=", TOKEN),
+                ("authbad", pin, "wrong-test-token-000000000000000000000"),
+            ):
+                rejected_port = free_port()
+                config = harness.write(peer, client_config(peer, relay_port, candidate_pin,
+                                                           socks=rejected_port, token=token, open_timeout=3))
+                process = harness.start(peer, "client", config)
+                # Listener availability is independent of TLS/auth success.
+                wait_until(lambda: listener_open(rejected_port), f"{peer} proxy listener")
+                assert_rejected(lambda: socks_connect(rejected_port, "127.0.0.1", target_port, timeout=6))
+                process.terminate()
+                process.wait(timeout=5)
+            print("PASS incorrect SPKI pin + incorrect peer token cannot forward")
+            for name in ("relay", "home", "office"):
+                assert "panicked at" not in harness.log(name), f"panic in {name}"
+            print("All NetCrow end-to-end checks passed.")
+        except BaseException:
+            harness.diagnostics()
+            raise
+        finally:
+            harness.close()
+            for server in (httpd, halfclose, outside):
+                server.shutdown()
+                server.server_close()
+
+
+def listener_open(port):
+    with socket.create_connection(("127.0.0.1", port), timeout=0.2):
+        return True
+
+
+if __name__ == "__main__":
+    candidate = sys.argv[1] if len(sys.argv) > 1 else os.environ.get("NETCROW_BIN", "target/debug/netcrow")
+    executable = Path(candidate).resolve()
+    if not executable.is_file():
+        raise SystemExit(f"Build NetCrow first: binary not found at {executable}")
+    run(str(executable))
