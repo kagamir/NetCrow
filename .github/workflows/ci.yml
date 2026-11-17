@@ -165,41 +165,6 @@ jobs:
           merge-multiple: true
       - name: Require all six packages and generate SHA-256 manifest
         run: python scripts/package-release.py --checksums dist
-      - name: Upload complete draft and publish
+      - name: Complete and verify release assets
         shell: bash
-        run: |
-          set -euo pipefail
-
-          verify_release_assets() {
-            local verify_dir asset
-            local patterns=()
-            verify_dir=$(mktemp -d "$RUNNER_TEMP/netcrow-release.XXXXXX")
-            for asset in dist/*; do
-              patterns+=(--pattern "${asset##*/}")
-            done
-            gh release download --dir "$verify_dir" "${patterns[@]}" -- "$RELEASE_TAG"
-            cp "$verify_dir/SHA256SUMS" "$verify_dir.sha256"
-            python scripts/package-release.py --checksums "$verify_dir"
-            if ! cmp -s "$verify_dir.sha256" "$verify_dir/SHA256SUMS"; then
-              echo 'Release assets do not match their published SHA256SUMS' >&2
-              exit 1
-            fi
-            rm -rf -- "$verify_dir" "$verify_dir.sha256"
-          }
-
-          if state=$(gh release view --json isDraft --jq .isDraft -- "$RELEASE_TAG"); then
-            if [[ "$state" == false ]]; then
-              # Published/immutable releases are never overwritten on a rerun.
-              verify_release_assets
-              echo 'Existing published release is complete and verified.'
-              exit 0
-            fi
-          else
-            gh release create --verify-tag --draft --generate-notes \
-              --title "$RELEASE_TAG" -- "$RELEASE_TAG"
-          fi
-
-          # Interrupted attempts remain drafts; clobber is only used on drafts.
-          gh release upload --clobber -- "$RELEASE_TAG" dist/*
-          verify_release_assets
-          gh release edit --verify-tag --draft=false -- "$RELEASE_TAG"
+        run: python scripts/publish-release.py --tag="$RELEASE_TAG" --assets dist
