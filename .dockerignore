@@ -1,0 +1,10 @@
+# Only the executable and license enter the image build context.
+**
+!Dockerfile
+!.dockerignore
+!LICENSE
+!docker-bin/
+!docker-bin/amd64/
+!docker-bin/amd64/netcrow
+!docker-bin/arm64/
+!docker-bin/arm64/netcrow

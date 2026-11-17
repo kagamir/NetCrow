@@ -182,7 +182,8 @@ pub struct ControlConfig {
 #[serde(deny_unknown_fields)]
 pub struct PageRule {
     pub url: String,
-    pub regex: String,
+    pub regex: Option<String>,
+    pub keyword: Option<String>,
 }
 
 pub fn load_relay(path: &Path) -> Result<RelayConfig> {
@@ -211,7 +212,7 @@ fn resolve_path(config_path: &Path, path: &mut PathBuf) {
         *path = config_path.parent().unwrap_or(Path::new(".")).join(&*path);
     }
 }
-fn identity(id: &str, token: &str) -> Result<()> {
+fn identity(id: &str) -> Result<()> {
     ensure!(
         !id.is_empty()
             && id.len() <= 64
@@ -219,10 +220,6 @@ fn identity(id: &str, token: &str) -> Result<()> {
                 .bytes()
                 .all(|b| b.is_ascii_alphanumeric() || b"_-".contains(&b)),
         "invalid peer id"
-    );
-    ensure!(
-        token.len() >= 32 && token.len() <= 256,
-        "tokens must be 32..256 bytes"
     );
     Ok(())
 }
@@ -244,7 +241,7 @@ impl RelayConfig {
         );
         let mut ids = HashSet::new();
         for peer in &self.peers {
-            identity(&peer.id, &peer.token)?;
+            identity(&peer.id)?;
             ensure!(ids.insert(&peer.id), "duplicate peer id");
         }
         Ok(())
@@ -252,7 +249,7 @@ impl RelayConfig {
 }
 impl ClientConfig {
     pub fn validate(&self) -> Result<()> {
-        identity(&self.id, &self.token)?;
+        identity(&self.id)?;
         let url = url::Url::parse(&self.relay_url)?;
         ensure!(
             url.scheme() == "wss"
@@ -306,7 +303,15 @@ impl ClientConfig {
                         && url.fragment().is_none(),
                     "control URL must have a host and no userinfo or fragment"
                 );
-                regex::Regex::new(&rule.regex).context("invalid control regex")?;
+                match (&rule.regex, &rule.keyword) {
+                    (Some(pattern), None) => {
+                        regex::Regex::new(pattern).context("invalid control regex")?;
+                    }
+                    (None, Some(keyword)) => {
+                        ensure!(!keyword.is_empty(), "control keyword must not be empty");
+                    }
+                    _ => bail!("control rule must set exactly one of regex or keyword"),
+                }
             }
         }
         Ok(())
@@ -345,6 +350,45 @@ mod tests {
         let mut c = client("");
         c.relay_url = "ws://localhost/netcrow".into();
         assert!(c.validate().is_err());
+    }
+    #[test]
+    fn tokens_preserve_arbitrary_utf8_without_length_limits() {
+        for token in [
+            String::new(),
+            "x".into(),
+            " 中文🔑\"'\\\n\r\t\0 ".into(),
+            "长".repeat(100_000),
+        ] {
+            let literal = toml::Value::String(token.clone()).to_string();
+            let client: ClientConfig = toml::from_str(&format!(
+                "id='home'\ntoken={literal}\nrelay_url='wss://localhost/netcrow'"
+            ))
+            .unwrap();
+            let relay: RelayConfig = toml::from_str(&format!(
+                "listen='127.0.0.1:8443'\n[[peers]]\nid='home'\ntoken={literal}"
+            ))
+            .unwrap();
+            assert!(client.validate().is_ok());
+            assert!(relay.validate().is_ok());
+            assert_eq!(client.token, token);
+            assert_eq!(relay.peers[0].token, token);
+        }
+    }
+    #[test]
+    fn control_rules_require_one_valid_matcher() {
+        for kind in ["disable", "enable"] {
+            let config = |matcher: &str| {
+                client(&format!(
+                    "[[control.{kind}]]\nurl='https://example.com/control'\n{matcher}"
+                ))
+            };
+            assert!(config("regex='^STOP$'").validate().is_ok());
+            assert!(config("keyword='停用[office].*'").validate().is_ok());
+            assert!(config("").validate().is_err());
+            assert!(config("regex='STOP'\nkeyword='STOP'").validate().is_err());
+            assert!(config("keyword=''").validate().is_err());
+            assert!(config("regex='['").validate().is_err());
+        }
     }
     #[test]
     fn proxy_subnets_distinguish_automatic_and_explicit_selection() {

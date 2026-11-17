@@ -1,5 +1,6 @@
 //! Client connection lifecycle and multiplexed TCP streams.
 use crate::{
+    auth,
     config::ClientConfig,
     protocol::{self, Frame, Route, CHUNK_SIZE, INITIAL_CREDITS, QUEUE_SIZE, VERSION},
 };
@@ -200,6 +201,8 @@ async fn manage(
     mut disabled: watch::Receiver<bool>,
     route_snapshot: watch::Sender<Option<Vec<Route>>>,
 ) -> Result<()> {
+    // Hash exact configuration bytes once, not on every reconnect.
+    let wire_token = auth::token_digest(&config.token);
     let mut pending = VecDeque::new();
     let mut last_activity = Instant::now();
     let mut asleep = false;
@@ -257,7 +260,7 @@ async fn manage(
             _ = wait_disabled(&mut disabled) => continue,
             result = time::timeout(
                 Duration::from_secs(config.connection.connect_timeout_secs),
-                connect(&config, tls.clone()),
+                connect(&config, &wire_token, tls.clone()),
             ) => result.context("WSS connection timed out").and_then(|r| r),
         };
         let outcome = match connection {
@@ -308,6 +311,7 @@ async fn manage(
 
 async fn connect(
     config: &ClientConfig,
+    wire_token: &str,
     tls: Arc<rustls::ClientConfig>,
 ) -> Result<(Socket, Vec<Route>)> {
     let (mut socket, _) = tokio_tungstenite::connect_async_tls_with_config(
@@ -322,7 +326,7 @@ async fn connect(
         .send(protocol::encode(&Frame::Hello {
             version: VERSION,
             id: config.id.clone(),
-            token: config.token.clone(),
+            token: wire_token.to_owned(),
             subnets: config.shared_subnets.clone(),
         })?)
         .await?;

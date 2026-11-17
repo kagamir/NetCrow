@@ -9,6 +9,7 @@ from __future__ import annotations
 import concurrent.futures
 import hashlib
 import http.server
+import json
 import os
 from pathlib import Path
 import re
@@ -22,7 +23,10 @@ import threading
 import time
 
 PAYLOAD = bytes(range(256)) * 512
-TOKEN = "netcrow-integration-test-secret-00000000"
+# Short UTF-8 input with TOML-sensitive characters and control bytes exercises
+# raw configuration decoding before the client and relay derive SHA-256 tokens.
+TOKEN = '密钥"\\\n\t\x00\x7f🔑'
+STOP_KEYWORD = "STOP[网].*"
 CONTROL = {"body": b"RUN", "status": 200}
 
 
@@ -211,11 +215,17 @@ class Harness:
             print(f"\n--- {name} log ---\n{self.log(name)[-20000:]}", file=sys.stderr)
 
 
+def toml_string(value):
+    # JSON's string escapes are also TOML basic-string escapes. Keep Unicode
+    # literal (including non-BMP scalars), and escape TOML's forbidden DEL byte.
+    return json.dumps(value, ensure_ascii=False).replace("\x7f", "\\u007f")
+
+
 def client_config(peer, relay_port, pin, *, socks=None, http=None, shares=False,
                   token=TOKEN, idle=0, control_port=None, open_timeout=12,
                   proxy_subnets=None, sleep_secs=4):
     lines = [
-        f'id = "{peer}"', f'token = "{token}"',
+        f'id = "{peer}"', f'token = {toml_string(token)}',
         f'relay_url = "wss://localhost:{relay_port}/netcrow"',
         f'shared_subnets = {["127.0.0.1/32"] if shares else []!r}'.replace("'", '"'),
     ]
@@ -235,7 +245,7 @@ def client_config(peer, relay_port, pin, *, socks=None, http=None, shares=False,
         lines += [
             "[control]", "interval_secs = 1", "timeout_secs = 2", "max_body_bytes = 1024",
             "[[control.disable]]", f'url = "http://127.0.0.1:{control_port}/control"',
-            'regex = "STOP"', "[[control.enable]]",
+            f'keyword = {toml_string(STOP_KEYWORD)}', "[[control.enable]]",
             f'url = "http://127.0.0.1:{control_port}/control"', 'regex = "RUN"',
         ]
     return "\n".join(lines) + "\n"
@@ -254,7 +264,7 @@ def run(binary):
         relay_port, socks_port, http_port = (free_port() for _ in range(3))
         try:
             peers = "\n".join(
-                f'[[peers]]\nid = "{peer}"\ntoken = "{TOKEN}"'
+                f'[[peers]]\nid = "{peer}"\ntoken = {toml_string(TOKEN)}'
                 for peer in ("office", "home", "pinbad", "authbad", "ca", "selected", "sleepy")
             )
             relay = harness.write("relay", f'''
@@ -285,7 +295,7 @@ names = ["localhost", "127.0.0.1"]
             harness.wait_log("office", "WSS connected")
             harness.start("home", "client", home)
             wait_until(lambda: get_via_socks(socks_port, target_port), "SOCKS routed request", timeout=20)
-            print("PASS SOCKS5 IPv4 + large payload")
+            print("PASS short Unicode/control-character token authentication + SOCKS5 IPv4 + large payload")
             assert get_via_socks(socks_port, target_port, host="localhost")
             print("PASS SOCKS5 DNS name + route selection")
 
@@ -390,7 +400,9 @@ names = ["localhost", "127.0.0.1"]
             active = socks_connect(socks_port, "127.0.0.1", halfclose_port)
             active.sendall(b"unfinished request")
             home_offset = len(harness.log("home"))
-            CONTROL["body"] = b"STOP RUN"  # Disable wins when both rules match.
+            # Keyword is literal, including regex syntax; disable still wins
+            # when both the keyword and the legacy regex enable rule match.
+            CONTROL["body"] = f"before {STOP_KEYWORD} RUN after".encode("utf-8")
             harness.wait_log("home", "remote control disabled client", after=home_offset)
             active.settimeout(5)
             try:
@@ -407,7 +419,7 @@ names = ["localhost", "127.0.0.1"]
             harness.wait_log("selected", "remote control disabled client")
             assert get_via_socks(selected_port, target_port)
             assert_rejected(lambda: socks_connect(selected_port, "127.0.0.2", outside.server_port, timeout=4))
-            print("PASS remote disable closes tunnel streams while existing/new direct streams continue")
+            print("PASS literal keyword disables with priority over regex enable; direct streams continue")
 
             CONTROL["body"] = b"RUN"
             CONTROL["status"] = 500

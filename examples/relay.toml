@@ -14,8 +14,8 @@ names = ["relay.example.com"]
 # 中继只登记客户端身份；共享网段由各客户端自行设置。
 [[peers]]
 id = "office"
-token = "REPLACE_WITH_RANDOM_OFFICE_TOKEN_AT_LEAST_32_BYTES"
+token = "REPLACE_WITH_RANDOM_OFFICE_TOKEN"
 
 [[peers]]
 id = "home"
-token = "REPLACE_WITH_RANDOM_HOME_TOKEN_AT_LEAST_32_BYTES"
+token = "REPLACE_WITH_RANDOM_HOME_TOKEN"

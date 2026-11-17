@@ -1,6 +1,6 @@
 # 家庭客户端：提供本机代理，不发布家庭网络。
 id = "home"
-token = "REPLACE_WITH_RANDOM_HOME_TOKEN_AT_LEAST_32_BYTES"
+token = "REPLACE_WITH_RANDOM_HOME_TOKEN"
 relay_url = "wss://relay.example.com/netcrow"
 shared_subnets = []
 # 省略 proxy_subnets：远端共享子网经中继，其余目的地址本机直连。

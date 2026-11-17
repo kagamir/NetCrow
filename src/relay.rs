@@ -1,5 +1,6 @@
 //! Authenticated, relay-only stream switching. The relay never dials advertised targets.
 use crate::{
+    auth,
     config::RelayConfig,
     protocol::{self, Frame, Route, VERSION},
     tls,
@@ -15,7 +16,6 @@ use std::{
     task::{Context as TaskContext, Poll},
     time::Duration,
 };
-use subtle::ConstantTimeEq;
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf},
     net::{TcpListener, TcpStream},
@@ -59,6 +59,7 @@ struct Stream {
 }
 struct State {
     config: Arc<RelayConfig>,
+    token_digests: HashMap<String, String>,
     peers: HashMap<String, Peer>,
     streams: HashMap<u64, Stream>,
     index: HashMap<Endpoint, u64>,
@@ -68,8 +69,15 @@ struct State {
 
 impl State {
     fn new(config: Arc<RelayConfig>) -> Self {
+        // Configuration tokens may be arbitrarily long; hash them only at startup.
+        let token_digests = config
+            .peers
+            .iter()
+            .map(|peer| (peer.id.clone(), auth::token_digest(&peer.token)))
+            .collect();
         Self {
             config,
+            token_digests,
             peers: HashMap::new(),
             streams: HashMap::new(),
             index: HashMap::new(),
@@ -130,14 +138,12 @@ impl State {
     fn authenticate(&self, version: u16, id: &str, token: &str, subnets: &[IpNet]) -> Result<()> {
         ensure!(version == VERSION, "unsupported protocol version");
         ensure!(subnets.len() <= 64, "too many advertisements");
-        let peer = self
-            .config
-            .peers
-            .iter()
-            .find(|p| p.id == id)
+        let expected_digest = self
+            .token_digests
+            .get(id)
             .context("authentication failed")?;
         ensure!(
-            bool::from(peer.token.as_bytes().ct_eq(token.as_bytes())),
+            auth::digest_matches(expected_digest, token),
             "authentication failed"
         );
         ensure!(
@@ -777,7 +783,7 @@ token = "cccccccccccccccccccccccccccccccc"
     #[test]
     fn authenticated_clients_can_advertise_arbitrary_subnets() {
         let state = state();
-        let token = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let token = auth::token_digest("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
         let subnets = [
             "10.1.0.0/16",
             "192.168.5.0/24",
@@ -786,23 +792,67 @@ token = "cccccccccccccccccccccccccccccccc"
             "::/0",
         ]
         .map(|subnet| subnet.parse().unwrap());
-        assert!(state.authenticate(VERSION, "a", token, &subnets).is_ok());
+        assert!(state.authenticate(VERSION, "a", &token, &subnets).is_ok());
         assert!(state.authenticate(VERSION, "a", "wrong", &subnets).is_err());
         assert!(state
-            .authenticate(VERSION, "unknown", token, &subnets)
+            .authenticate(VERSION, "unknown", &token, &subnets)
             .is_err());
         assert!(state
-            .authenticate(VERSION + 1, "a", token, &subnets)
+            .authenticate(VERSION + 1, "a", &token, &subnets)
             .is_err());
         assert!(state
             .authenticate(
                 VERSION,
                 "a",
-                token,
+                &token,
                 &vec!["10.0.0.0/8".parse().unwrap(); 65]
             )
             .is_err());
     }
+    #[test]
+    fn authentication_rejects_raw_double_hashed_and_legacy_tokens() {
+        let state = state();
+        let raw = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let wire = auth::token_digest(raw);
+        assert!(state.authenticate(VERSION, "a", &wire, &[]).is_ok());
+        for invalid in [
+            raw.to_owned(),
+            auth::token_digest(&wire),
+            wire.to_uppercase(),
+            auth::token_digest("wrong"),
+        ] {
+            assert!(state.authenticate(VERSION, "a", &invalid, &[]).is_err());
+        }
+        for legacy_token in [raw, &wire] {
+            let error = state.authenticate(1, "a", legacy_token, &[]).unwrap_err();
+            assert_eq!(error.to_string(), "unsupported protocol version");
+        }
+    }
+
+    #[test]
+    fn authentication_hashes_arbitrary_raw_configuration_tokens_exactly_once() {
+        let base = state().config;
+        for raw in [
+            String::new(),
+            "x".into(),
+            " 口令\0\n\t ".into(),
+            "é".into(),
+            "e\u{301}".into(),
+            "a".repeat(64),
+            "long token".repeat(protocol::MAX_MESSAGE),
+        ] {
+            let mut config = base.as_ref().clone();
+            config.peers[0].token = raw.clone();
+            let state = State::new(Arc::new(config));
+            let wire = auth::token_digest(&raw);
+            assert!(state.authenticate(VERSION, "a", &wire, &[]).is_ok());
+            assert!(state.authenticate(VERSION, "a", &raw, &[]).is_err());
+            assert!(state
+                .authenticate(VERSION, "a", &auth::token_digest(&wire), &[])
+                .is_err());
+        }
+    }
+
     #[test]
     fn default_routes_cover_both_ip_families_and_specific_routes_take_precedence() {
         let mut state = state();
@@ -924,12 +974,12 @@ token = "cccccccccccccccccccccccccccccccc"
     fn duplicate_advertisements_are_rejected_but_overlap_is_allowed() {
         let mut state = state();
         let (_, _a) = register(&mut state, "a", &["10.1.0.0/16"]);
-        let token = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let token = auth::token_digest("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
         assert!(state
-            .authenticate(VERSION, "b", token, &["10.1.2.3/16".parse().unwrap()])
+            .authenticate(VERSION, "b", &token, &["10.1.2.3/16".parse().unwrap()])
             .is_err());
         assert!(state
-            .authenticate(VERSION, "b", token, &["10.1.2.0/24".parse().unwrap()])
+            .authenticate(VERSION, "b", &token, &["10.1.2.0/24".parse().unwrap()])
             .is_ok());
     }
     #[test]

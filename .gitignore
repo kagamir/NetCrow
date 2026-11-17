@@ -1,5 +1,7 @@
 /target/
 /dist/
+/docker-bin/
+/netcrow-image.tar
 *.pem
 *.key
 /client.toml

@@ -5,7 +5,8 @@ use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
 use tokio_tungstenite::tungstenite::{protocol::WebSocketConfig, Message};
 
-pub const VERSION: u16 = 1;
+// Version 2 authenticates with SHA-256 digests of the configured raw tokens.
+pub const VERSION: u16 = 2;
 pub const CHUNK_SIZE: usize = 16 * 1024;
 pub const MAX_MESSAGE: usize = 256 * 1024;
 pub const QUEUE_SIZE: usize = 64;
@@ -24,6 +25,7 @@ pub enum Frame {
     Hello {
         version: u16,
         id: String,
+        /// Lowercase SHA-256 hex digest, never the raw configuration token.
         token: String,
         subnets: Vec<IpNet>,
     },
