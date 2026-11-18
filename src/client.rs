@@ -25,7 +25,10 @@ use tokio::{
     time::{self, Instant},
 };
 use tokio_rustls::{client::TlsStream, TlsConnector};
-use tokio_tungstenite::{tungstenite::Message, WebSocketStream};
+use tokio_tungstenite::{
+    tungstenite::{client::IntoClientRequest, http::header::HOST, Message},
+    WebSocketStream,
+};
 use tokio_util::sync::CancellationToken;
 
 type Socket = WebSocketStream<TlsStream<TcpStream>>;
@@ -318,8 +321,20 @@ async fn connect(
     wire_token: &str,
     tls: Arc<rustls::ClientConfig>,
 ) -> Result<(Socket, Vec<Route>)> {
-    // The transport address and HTTP Host come only from relay_addr. The TLS
-    // server name can differ, or SNI can be suppressed without disabling trust.
+    let mut request = endpoint
+        .websocket_uri
+        .as_str()
+        .into_client_request()
+        .context("build relay WebSocket request")?;
+    request.headers_mut().insert(
+        HOST,
+        endpoint
+            .websocket_host
+            .parse()
+            .context("invalid relay HTTP Host")?,
+    );
+    // TCP destination and WebSocket path come from relay_addr. HTTP Host and
+    // TLS name are independent; suppressing SNI never disables TLS trust.
     let stream = TcpStream::connect((endpoint.host.as_str(), endpoint.port))
         .await
         .context("connect relay TCP")?;
@@ -328,7 +343,7 @@ async fn connect(
         .await
         .context("connect relay TLS")?;
     let (mut socket, _) = tokio_tungstenite::client_async_with_config(
-        endpoint.websocket_uri.as_str(),
+        request,
         stream,
         Some(protocol::websocket_config()),
     )
@@ -797,17 +812,40 @@ mod tests {
     #[tokio::test]
     // Tungstenite fixes the handshake callback's error type to an HTTP response.
     #[allow(clippy::result_large_err)]
-    async fn relay_transport_and_websocket_authority_are_independent_of_sni() {
+    async fn relay_transport_host_and_path_are_independent_of_sni() {
         time::timeout(Duration::from_secs(10), async {
-            for (host, sni, expected_sni) in [
+            for (host, sni, relay_host, expected_sni, expected_host) in [
                 (
                     "127.0.0.1",
                     Some("virtual.example"),
+                    None,
                     Some("virtual.example"),
+                    "127.0.0.1",
                 ),
-                ("localhost", None, Some("localhost")),
-                ("localhost", Some(""), None),
-                ("127.0.0.1", None, None),
+                (
+                    "127.0.0.1",
+                    Some("virtual.example"),
+                    Some("front.example:9443"),
+                    Some("virtual.example"),
+                    "front.example:9443",
+                ),
+                ("localhost", None, None, Some("localhost"), "localhost"),
+                ("localhost", Some(""), None, None, "localhost"),
+                (
+                    "localhost",
+                    Some(""),
+                    Some("front.example"),
+                    None,
+                    "front.example",
+                ),
+                ("127.0.0.1", None, None, None, "127.0.0.1"),
+                (
+                    "127.0.0.1",
+                    None,
+                    Some("[2001:db8::5]:9443"),
+                    None,
+                    "[2001:db8::5]:9443",
+                ),
             ] {
                 let directory = tempfile::tempdir().unwrap();
                 let identity = crate::config::ServerTls {
@@ -822,8 +860,11 @@ mod tests {
                 let sni_config = sni
                     .map(|name| format!("relay_sni='{name}'\n"))
                     .unwrap_or_default();
+                let host_config = relay_host
+                    .map(|name| format!("relay_host='{name}'\n"))
+                    .unwrap_or_default();
                 let mut config: ClientConfig = toml::from_str(&format!(
-                    "id='test-peer'\ntoken='raw token'\nrelay_addr='{host}:{}{path}'\n{sni_config}",
+                    "id='test-peer'\ntoken='raw token'\nrelay_addr='{host}:{}{path}'\n{sni_config}{host_config}",
                     address.port()
                 ))
                 .unwrap();
@@ -851,6 +892,7 @@ mod tests {
                     let mut websocket = tokio_tungstenite::accept_hdr_async_with_config(
                         stream,
                         move |request: &Request, response: Response| {
+                            assert_eq!(request.headers().get_all(HOST).iter().count(), 1);
                             request_tx
                                 .send((
                                     request.headers()["host"].to_str().unwrap().to_owned(),
@@ -893,7 +935,7 @@ mod tests {
                 assert_eq!(received_routes, expected_routes);
                 assert_eq!(
                     request_rx.await.unwrap(),
-                    (format!("{host}:{}", address.port()), path.into())
+                    (expected_host.into(), path.into())
                 );
                 assert_eq!(server.await.unwrap().as_deref(), expected_sni);
             }

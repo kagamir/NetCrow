@@ -106,6 +106,9 @@ pub struct ClientConfig {
     /// Omitted: verify the dial host. Empty: omit SNI but still verify that host.
     #[serde(default)]
     pub relay_sni: Option<String>,
+    /// HTTP Host override. Omitted: use the dial host without its port.
+    #[serde(default)]
+    pub relay_host: Option<String>,
     #[serde(default)]
     pub shared_subnets: Vec<IpNet>,
     /// Omitted: all learned remote routes. An explicit empty list selects direct only.
@@ -124,12 +127,13 @@ pub struct ClientConfig {
     #[serde(default)]
     pub control: Option<ControlConfig>,
 }
-/// Separates the TCP/WebSocket destination from TLS identity and SNI policy.
+/// Separates the TCP/WebSocket destination, HTTP Host and TLS identity.
 #[derive(Debug, Clone)]
 pub struct RelayEndpoint {
     pub host: String,
     pub port: u16,
     pub websocket_uri: String,
+    pub websocket_host: String,
     pub server_name: ServerName<'static>,
     pub enable_sni: bool,
 }
@@ -284,6 +288,45 @@ fn normalize_host(value: &str) -> Result<String> {
     Ok(host)
 }
 
+fn normalize_http_host(value: &str) -> Result<String> {
+    let (host, port) = if let Some(bracketed) = value.strip_prefix('[') {
+        let (literal, suffix) = bracketed
+            .split_once(']')
+            .context("HTTP Host IPv6 addresses must use [address]")?;
+        let address: Ipv6Addr = literal.parse().context("invalid HTTP Host IPv6 address")?;
+        let port = if suffix.is_empty() {
+            None
+        } else {
+            Some(suffix.strip_prefix(':').context("invalid HTTP Host port")?)
+        };
+        (format!("[{address}]"), port)
+    } else {
+        let (host, port) = match value.rsplit_once(':') {
+            Some((host, port)) => (host, Some(port)),
+            None => (value, None),
+        };
+        ensure!(
+            !host.contains(':'),
+            "HTTP Host IPv6 addresses must use [address]"
+        );
+        (normalize_host(host)?, port)
+    };
+    match port {
+        Some(port) => {
+            ensure!(
+                !port.is_empty() && port.bytes().all(|byte| byte.is_ascii_digit()),
+                "HTTP Host port must be an integer from 1 to 65535"
+            );
+            let port: u16 = port
+                .parse()
+                .context("HTTP Host port must be from 1 to 65535")?;
+            ensure!(port != 0, "HTTP Host port must be from 1 to 65535");
+            Ok(format!("{host}:{port}"))
+        }
+        None => Ok(host),
+    }
+}
+
 fn validate_websocket_path(value: &str) -> Result<()> {
     ensure!(value.starts_with('/'), "WebSocket path must begin with /");
     let bytes = value.as_bytes();
@@ -364,6 +407,10 @@ impl ClientConfig {
         // Construct from the parsed authority, without URL path normalization.
         // In particular, keep :443, dot segments and percent-encoded bytes intact.
         let websocket_uri = format!("wss://{authority_host}:{port}{websocket_path}");
+        let websocket_host = match self.relay_host.as_deref() {
+            Some(value) => normalize_http_host(value).context("invalid relay_host")?,
+            None => authority_host,
+        };
         let uri: tokio_tungstenite::tungstenite::http::Uri = websocket_uri
             .parse()
             .context("relay_addr does not produce a valid WebSocket URI")?;
@@ -386,6 +433,7 @@ impl ClientConfig {
             host,
             port,
             websocket_uri,
+            websocket_host,
             server_name,
             enable_sni: self.relay_sni.as_deref() != Some(""),
         })
@@ -486,6 +534,7 @@ mod tests {
         assert_eq!(default.host, "localhost");
         assert_eq!(default.port, 443);
         assert_eq!(default.websocket_uri, "wss://localhost:443/netcrow");
+        assert_eq!(default.websocket_host, "localhost");
         assert_eq!(default.server_name.to_str(), "localhost");
         assert!(default.enable_sni);
         for (address, host, port, uri) in [
@@ -526,7 +575,83 @@ mod tests {
             assert_eq!(endpoint.host, host);
             assert_eq!(endpoint.port, port);
             assert_eq!(endpoint.websocket_uri, uri);
+            let expected_host = if host.contains(':') {
+                format!("[{host}]")
+            } else {
+                host.to_owned()
+            };
+            assert_eq!(endpoint.websocket_host, expected_host);
             assert_eq!(endpoint.server_name.to_str(), host);
+        }
+    }
+
+    #[test]
+    fn http_host_override_does_not_change_transport_path_or_tls_identity() {
+        let mut config = client("relay_host='web.example:8443'\nrelay_sni='tls.example'");
+        config.relay_addr = "127.0.0.1:443/a%2Fb".into();
+        for (host, expected) in [
+            ("web.example", "web.example"),
+            ("WEB.EXAMPLE:8443", "web.example:8443"),
+            ("192.0.2.1", "192.0.2.1"),
+            ("192.0.2.1:443", "192.0.2.1:443"),
+            ("[2001:0db8::1]", "[2001:db8::1]"),
+            ("[2001:db8::1]:8443", "[2001:db8::1]:8443"),
+            ("bücher.example", "xn--bcher-kva.example"),
+        ] {
+            config.relay_host = Some(host.into());
+            let endpoint = config.relay_endpoint().unwrap();
+            assert_eq!(endpoint.websocket_host, expected);
+            assert_eq!(endpoint.host, "127.0.0.1");
+            assert_eq!(endpoint.port, 443);
+            assert_eq!(endpoint.websocket_uri, "wss://127.0.0.1:443/a%2Fb");
+            assert_eq!(endpoint.server_name.to_str(), "tls.example");
+            assert!(endpoint.enable_sni);
+        }
+        config.relay_sni = Some(String::new());
+        let endpoint = config.relay_endpoint().unwrap();
+        assert_eq!(endpoint.websocket_host, "xn--bcher-kva.example");
+        assert!(!endpoint.enable_sni);
+        assert_eq!(endpoint.server_name.to_str(), "127.0.0.1");
+    }
+
+    #[test]
+    fn invalid_http_host_values_are_rejected() {
+        for host in [
+            "",
+            " ",
+            "web.example ",
+            "https://web.example",
+            "web.example/path",
+            "user@web.example",
+            "web.example?x",
+            "web.example#x",
+            "web.example\\x",
+            "web.example\r\nX-Injected: yes",
+            "web.example\n",
+            "web.example\0",
+            "web.example\t",
+            "web.example,other.example",
+            "bad..name",
+            "%65xample.com",
+            "web.example:",
+            "web.example:+443",
+            "web.example:0",
+            "web.example:65536",
+            "web.example:443:80",
+            "::1",
+            "2001:db8::1:443",
+            "[::1",
+            "[::1]suffix",
+            "[::1]:",
+            "[127.0.0.1]",
+            "[fe80::1%eth0]",
+        ] {
+            let mut config = client("");
+            config.relay_host = Some(host.into());
+            assert!(
+                config.validate().is_err(),
+                "accepted invalid HTTP Host {host:?}"
+            );
         }
     }
 

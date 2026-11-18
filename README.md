@@ -132,6 +132,8 @@ relay_addr = "relay.example.com:443/netcrow" # 必填：域名:端口/路径 或
 # relay_addr = "[2001:db8::1]:443/netcrow"    # IPv6 地址须加方括号；路径须与中继 websocket_path 一致
 # relay_sni = "relay.example.com" # 默认省略：使用 relay_addr 中的域名或 IP；也可指定其他域名或 IP
 # relay_sni = ""                 # 显式空字符串：不发送 TLS SNI；与上一行二选一
+# relay_host = "relay.example.com" # 默认省略：HTTP Host 使用 relay_addr 的域名或 IP，不带端口
+# 可覆盖为域名或 IP，并可附 :端口；IPv6 须加方括号，例如 "[2001:db8::1]:8443"。不允许空字符串。
 shared_subnets = []          # 默认：不共享子网；最多 64 个 IPv4 / IPv6 CIDR
 # shared_subnets = ["192.168.1.0/24"] # 替换上一行可共享此网段
 
@@ -183,7 +185,9 @@ enable = []                 # 默认：无恢复规则；仅配置此组时，�
 
 `token` 支持任意 UTF-8 字符串，不限制长度，也允许空字符串；引号、换行等按 TOML 字符串语法转义。解析后的原文直接计算 SHA-256，使用其 64 个小写十六进制字符组成的摘要认证，不裁剪空白、不做 Unicode 归一化，配置中无需预先哈希。此认证方式使用协议版本 2，客户端和中继必须一起升级，旧版本无法互连。
 
-`relay_addr` 始终通过 WSS 连接，必须包含端口和以 `/` 开头的路径，不接受协议前缀、账号密码、查询参数或片段。实际 TCP 连接地址、HTTP `Host` 和 WebSocket 路径均取自它；路径按原样发送，非 ASCII 字符须使用百分号编码。旧配置中的 `relay_url` 已移除，例如 `wss://relay.example.com/netcrow` 应改为 `relay_addr = "relay.example.com:443/netcrow"`。
+`relay_addr` 始终通过 WSS 连接，必须包含端口和以 `/` 开头的路径，不接受协议前缀、账号密码、查询参数或片段。实际 TCP 连接地址和 WebSocket 路径取自它；路径按原样发送，非 ASCII 字符须使用百分号编码。旧配置中的 `relay_url` 已移除，例如 `wss://relay.example.com/netcrow` 应改为 `relay_addr = "relay.example.com:443/netcrow"`。
+
+`relay_host` 独立控制 WebSocket 握手中的 HTTP `Host`：省略时使用 `relay_addr` 的域名或 IP，**不包含端口**，IPv6 保留方括号。显式值可为域名或 IP，也可附带 `:端口`，IPv6 必须加方括号；不接受空字符串、协议前缀或路径。它不改变 TCP 连接目标、TLS SNI 或证书名称验证。
 
 `relay_sni` 独立控制 TLS 名称：省略时使用连接目标的域名或 IP，非空时使用指定名称，空字符串时关闭 SNI 发送。CA 模式按非空 `relay_sni` 验证证书名称；省略或为空时按连接目标验证，关闭 SNI 不会关闭证书验证。IP 名称用于验证证书中的 IP，按 TLS 标准不作为 SNI 扩展发送。中继使用配置的证书兼容默认、自定义和无 SNI 连接；指纹模式仍校验公钥、有效期与握手签名。
 

@@ -5,6 +5,8 @@ relay_addr = "relay.example.com:443/netcrow"
 # relay_sni 默认使用 relay_addr 中的域名或 IP；空字符串表示不发送 SNI。
 # relay_sni = "relay.example.com"
 # relay_sni = ""
+# relay_host 默认使用 relay_addr 的域名或 IP，不带端口；IPv6 保留方括号。
+# relay_host = "relay.example.com" # 可附 :端口；IPv6 须加方括号；不允许空字符串。
 shared_subnets = []
 # 省略 proxy_subnets：远端共享子网经中继，其余目的地址本机直连。
 # 显式列表：仅列表内地址经中继，其余直连；空列表 [] 表示全部直连。
